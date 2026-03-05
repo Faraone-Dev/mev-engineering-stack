@@ -108,6 +108,14 @@ Use only after verifying network and key settings:
 ./scripts/deploy.sh arbitrum
 ```
 
+After deployment, apply contract security configuration before live execution:
+
+- `FlashArbitrage.setExecutor(executor, true)`
+- `FlashArbitrage.setTrustedV2Router(router, true)` for each approved router
+- `FlashArbitrage.setTrustedV3Factory(factory)`
+- `MultiDexRouter.setTrustedFactories(v2Factory, v3Factory)`
+- `FlashArbitrage.setPaused(false)` only after simulation and dry-run validation
+
 ## Troubleshooting
 
 - Build fails in `fast/`: verify C toolchain and `make` availability.

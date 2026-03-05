@@ -38,6 +38,8 @@ The repository is structured for technical review, reproducible builds, and iter
 
 - ✅ Multi-stack build and test flow available
 - ✅ CI pipeline configured for Rust, Go, and Solidity
+- ✅ Contract-layer callback spoofing hardening (Balancer + Uniswap V3)
+- ✅ Deterministic route validation with trusted factory/router controls
 - ⚠️ Some modules still contain placeholder/TODO logic (notably parts of detector/simulator)
 
 Positioning is intentionally transparent: strong technical foundation with active feature completion.
@@ -47,6 +49,24 @@ Positioning is intentionally transparent: strong technical foundation with activ
 - CI workflow: `.github/workflows/ci.yml`
 - Local gates: `make build`, `make test`, `make lint`, `make ci-local`
 - Security hygiene: sanitized templates (`config/.env.example`) + strict ignore rules
+
+## 🔐 Contract Hardening Highlights
+
+- Flash loan callback is bound to active execution context (`executor`, `token`, `amount`, `swap hash`).
+- Uniswap V3 callbacks are accepted only from the active pool for the active swap.
+- Swap route decoding rejects malformed payloads and unknown swap types.
+- V2/V3 execution paths validate trusted routers/factories before swap execution.
+- ERC20 transfer/transferFrom/approve wrappers enforce strict return-data checks.
+
+## ✅ Post-Deploy Security Checklist
+
+Before enabling execution in production:
+
+1. Set whitelisted executors.
+2. Set trusted V2 routers (FlashArbitrage).
+3. Set trusted V3 factory (FlashArbitrage).
+4. Set trusted V2/V3 factories (MultiDexRouter).
+5. Keep contract paused until off-chain simulation and dry-run checks are green.
 
 ## ⚡ Quick Start
 
