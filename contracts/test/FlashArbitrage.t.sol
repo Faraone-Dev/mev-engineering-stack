@@ -10,6 +10,7 @@ contract FlashArbitrageTest is Test {
     address public owner = address(0x1);
     address public executor = address(0x2);
     address public attacker = address(0x3);
+    address public constant BALANCER_VAULT = 0xBA12222222228d8Ba445958a75a0704d566BF2C8;
     
     // Mock tokens
     address public constant WETH = 0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2;
@@ -101,6 +102,27 @@ contract FlashArbitrageTest is Test {
         vm.prank(attacker);
         vm.expectRevert(FlashArbitrage.InvalidCallback.selector);
         flashArb.receiveFlashLoan(tokens, amounts, fees, "");
+    }
+
+    function test_BalancerCallbackWithoutActiveExecutionReverts() public {
+        address[] memory tokens = new address[](1);
+        tokens[0] = WETH;
+
+        uint256[] memory amounts = new uint256[](1);
+        amounts[0] = 1 ether;
+
+        uint256[] memory fees = new uint256[](1);
+        fees[0] = 0;
+
+        vm.prank(BALANCER_VAULT);
+        vm.expectRevert(FlashArbitrage.InvalidCallback.selector);
+        flashArb.receiveFlashLoan(tokens, amounts, fees, abi.encode(executor, bytes("")));
+    }
+
+    function test_UniswapV3CallbackSpoofReverts() public {
+        vm.prank(attacker);
+        vm.expectRevert(FlashArbitrage.InvalidCallback.selector);
+        flashArb.uniswapV3SwapCallback(1, 0, abi.encode(WETH, USDC));
     }
 
     /*//////////////////////////////////////////////////////////////
