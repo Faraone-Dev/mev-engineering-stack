@@ -2,10 +2,9 @@
 pragma solidity ^0.8.20;
 
 import {IBalancerVault, IFlashLoanRecipient} from "./interfaces/IBalancerVault.sol";
-import {IUniswapV3Pool} from "./interfaces/IUniswapV3.sol";
+import {IUniswapV3Factory, IUniswapV3Pool} from "./interfaces/IUniswapV3.sol";
 import {IUniswapV2Router} from "./interfaces/IUniswapV2.sol";
 import {IERC20} from "./interfaces/IERC20.sol";
-import {YulUtils} from "./libraries/YulUtils.sol";
 
 /// @title FlashArbitrage
 /// @author MEV Protocol Team
@@ -19,8 +18,14 @@ contract FlashArbitrage is IFlashLoanRecipient {
     error Unauthorized();
     error InsufficientProfit();
     error InvalidCallback();
+    error InvalidFlashLoanData();
+    error InvalidInput();
+    error InvalidSwapType();
+    error AlreadyExecuting();
+    error UntrustedTarget();
     error SwapFailed();
     error TransferFailed();
+    error ApproveFailed();
 
     /*//////////////////////////////////////////////////////////////
                                  EVENTS
@@ -59,11 +64,34 @@ contract FlashArbitrage is IFlashLoanRecipient {
     /// @notice Whitelisted executors
     mapping(address => bool) public executors;
 
+    /// @notice Whitelisted V2 routers.
+    mapping(address => bool) public trustedV2Routers;
+
+    /// @notice Trusted Uniswap V3 factory.
+    address public trustedV3Factory;
+
     /// @notice Pause state
     bool public paused;
 
     /// @notice Nonce for replay protection
     uint256 public nonce;
+
+    /// @dev Execution context to prevent forged callbacks and replayed payloads.
+    bool private executionActive;
+    address private pendingExecutor;
+    address private pendingToken;
+    uint256 private pendingAmount;
+    bytes32 private pendingSwapHash;
+
+    /// @dev Active V3 pool expected to call callback during a swap.
+    address private activeV3Pool;
+    address private activeV3TokenIn;
+
+    struct SwapInstruction {
+        uint8 swapType;
+        address target;
+        bytes params;
+    }
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -106,6 +134,15 @@ contract FlashArbitrage is IFlashLoanRecipient {
         uint256 amount,
         bytes calldata swapData
     ) external onlyExecutor notPaused {
+        if (token == address(0) || amount == 0 || swapData.length == 0) revert InvalidInput();
+        if (executionActive) revert AlreadyExecuting();
+
+        executionActive = true;
+        pendingExecutor = msg.sender;
+        pendingToken = token;
+        pendingAmount = amount;
+        pendingSwapHash = keccak256(swapData);
+
         // Prepare flash loan
         address[] memory tokens = new address[](1);
         tokens[0] = token;
@@ -123,6 +160,16 @@ contract FlashArbitrage is IFlashLoanRecipient {
             amounts,
             userData
         );
+
+        // Clear execution context after callback path is complete.
+        executionActive = false;
+        pendingExecutor = address(0);
+        pendingToken = address(0);
+        pendingAmount = 0;
+        pendingSwapHash = bytes32(0);
+        unchecked {
+            ++nonce;
+        }
     }
 
     /// @notice Balancer flash loan callback
@@ -135,19 +182,21 @@ contract FlashArbitrage is IFlashLoanRecipient {
     ) external override {
         // Verify callback is from Balancer
         if (msg.sender != address(BALANCER_VAULT)) revert InvalidCallback();
+        if (!executionActive) revert InvalidCallback();
+        if (tokens.length != 1 || amounts.length != 1 || feeAmounts.length != 1) revert InvalidFlashLoanData();
 
         // Decode user data
         (address executor, bytes memory swapData) = abi.decode(userData, (address, bytes));
         
         // Verify executor
         if (!executors[executor]) revert Unauthorized();
+        if (executor != pendingExecutor) revert InvalidCallback();
 
         address token = tokens[0];
         uint256 amount = amounts[0];
         uint256 fee = feeAmounts[0];
-
-        // Get balance before swaps
-        uint256 balanceBefore = _balanceOf(token);
+        if (token != pendingToken || amount != pendingAmount) revert InvalidCallback();
+        if (keccak256(swapData) != pendingSwapHash) revert InvalidCallback();
 
         // Execute swap sequence
         _executeSwaps(token, amount, swapData);
@@ -184,51 +233,35 @@ contract FlashArbitrage is IFlashLoanRecipient {
         uint256 amount,
         bytes memory swapData
     ) internal {
-        // Decode swap count
-        uint8 swapCount;
-        assembly {
-            swapCount := mload(add(swapData, 32))
-        }
+        SwapInstruction[] memory swaps = abi.decode(swapData, (SwapInstruction[]));
+        if (swaps.length == 0) revert InvalidInput();
 
-        uint256 offset = 33; // 32 bytes length + 1 byte count
         uint256 currentAmount = amount;
         address currentToken = token;
 
-        for (uint8 i = 0; i < swapCount; i++) {
-            // Decode swap type (1 = UniV2, 2 = UniV3, 3 = Curve)
-            uint8 swapType;
-            address target;
-            bytes memory params;
-
-            assembly {
-                swapType := mload(add(swapData, add(offset, 1)))
-                target := mload(add(swapData, add(offset, 21)))
-            }
-            
-            offset += 21;
-            
-            // Read params length and data
-            uint256 paramsLength;
-            assembly {
-                paramsLength := mload(add(swapData, add(offset, 32)))
-            }
-            offset += 32;
-            
-            params = new bytes(paramsLength);
-            for (uint256 j = 0; j < paramsLength; j++) {
-                params[j] = swapData[offset + j];
-            }
-            offset += paramsLength;
+        for (uint256 i = 0; i < swaps.length; ++i) {
+            SwapInstruction memory step = swaps[i];
 
             // Execute swap based on type
-            if (swapType == 1) {
-                currentAmount = _swapUniV2(target, currentToken, currentAmount, params);
-            } else if (swapType == 2) {
-                currentAmount = _swapUniV3(target, currentToken, currentAmount, params);
+            if (step.swapType == 1) {
+                currentAmount = _swapUniV2(step.target, currentToken, currentAmount, step.params);
+            } else if (step.swapType == 2) {
+                currentAmount = _swapUniV3(step.target, currentToken, currentAmount, step.params);
+            } else {
+                revert InvalidSwapType();
             }
-            
-            // Update current token for next swap
-            (currentToken) = abi.decode(params, (address));
+
+            currentToken = _decodeTokenOut(step.swapType, step.params);
+        }
+    }
+
+    function _decodeTokenOut(uint8 swapType, bytes memory params) internal pure returns (address tokenOut) {
+        if (swapType == 1) {
+            (tokenOut,) = abi.decode(params, (address, uint256));
+        } else if (swapType == 2) {
+            (tokenOut,,) = abi.decode(params, (address, uint24, uint160));
+        } else {
+            revert InvalidSwapType();
         }
     }
 
@@ -240,8 +273,11 @@ contract FlashArbitrage is IFlashLoanRecipient {
         bytes memory params
     ) internal returns (uint256 amountOut) {
         (address tokenOut, uint256 minOut) = abi.decode(params, (address, uint256));
+        if (router == address(0) || tokenOut == address(0)) revert InvalidInput();
+        if (!trustedV2Routers[router]) revert UntrustedTarget();
         
         // Approve router
+        _safeApprove(tokenIn, router, 0);
         _safeApprove(tokenIn, router, amountIn);
         
         // Build path
@@ -270,8 +306,27 @@ contract FlashArbitrage is IFlashLoanRecipient {
     ) internal returns (uint256 amountOut) {
         (address tokenOut, uint24 fee, uint160 sqrtPriceLimitX96) = 
             abi.decode(params, (address, uint24, uint160));
+        fee; // retained in params for pool consistency validation extensions.
+        if (pool == address(0) || tokenOut == address(0)) revert InvalidInput();
+
+        address poolToken0 = IUniswapV3Pool(pool).token0();
+        address poolToken1 = IUniswapV3Pool(pool).token1();
+        if (
+            !(
+                (tokenIn == poolToken0 && tokenOut == poolToken1) ||
+                (tokenIn == poolToken1 && tokenOut == poolToken0)
+            )
+        ) {
+            revert InvalidCallback();
+        }
+        address v3Factory = trustedV3Factory;
+        if (v3Factory == address(0)) revert UntrustedTarget();
+        if (IUniswapV3Factory(v3Factory).getPool(tokenIn, tokenOut, fee) != pool) revert UntrustedTarget();
         
         bool zeroForOne = tokenIn < tokenOut;
+
+        activeV3Pool = pool;
+        activeV3TokenIn = tokenIn;
         
         // Execute swap on pool
         (int256 amount0, int256 amount1) = IUniswapV3Pool(pool).swap(
@@ -283,6 +338,9 @@ contract FlashArbitrage is IFlashLoanRecipient {
                 : sqrtPriceLimitX96,
             abi.encode(tokenIn, tokenOut)
         );
+
+        activeV3Pool = address(0);
+        activeV3TokenIn = address(0);
         
         amountOut = uint256(zeroForOne ? -amount1 : -amount0);
     }
@@ -325,10 +383,15 @@ contract FlashArbitrage is IFlashLoanRecipient {
             }
             
             // Some tokens don't return a value
-            if gt(returndatasize(), 0) {
+            switch returndatasize()
+            case 0 {}
+            case 0x20 {
                 if iszero(mload(0x00)) {
                     revert(0, 0)
                 }
+            }
+            default {
+                revert(0, 0)
             }
         }
     }
@@ -346,6 +409,17 @@ contract FlashArbitrage is IFlashLoanRecipient {
             if iszero(success) {
                 revert(0, 0)
             }
+
+            switch returndatasize()
+            case 0 {}
+            case 0x20 {
+                if iszero(mload(0x00)) {
+                    revert(0, 0)
+                }
+            }
+            default {
+                revert(0, 0)
+            }
         }
     }
 
@@ -356,6 +430,18 @@ contract FlashArbitrage is IFlashLoanRecipient {
     /// @notice Add or remove executor
     function setExecutor(address executor, bool status) external onlyOwner {
         executors[executor] = status;
+    }
+
+    /// @notice Set trusted V2 router status.
+    function setTrustedV2Router(address router, bool status) external onlyOwner {
+        if (router == address(0)) revert InvalidInput();
+        trustedV2Routers[router] = status;
+    }
+
+    /// @notice Set the trusted Uniswap V3 factory.
+    function setTrustedV3Factory(address factory) external onlyOwner {
+        if (factory == address(0)) revert InvalidInput();
+        trustedV3Factory = factory;
     }
 
     /// @notice Pause/unpause contract
@@ -391,13 +477,14 @@ contract FlashArbitrage is IFlashLoanRecipient {
         int256 amount1Delta,
         bytes calldata data
     ) external {
+        if (msg.sender != activeV3Pool) revert InvalidCallback();
         (address tokenIn, address tokenOut) = abi.decode(data, (address, address));
+        tokenOut;
         
         // Pay the required input amount
         uint256 amountToPay = amount0Delta > 0 ? uint256(amount0Delta) : uint256(amount1Delta);
-        address tokenToPay = amount0Delta > 0 ? tokenIn : tokenOut;
-        
-        _safeTransfer(tokenToPay, msg.sender, amountToPay);
+        if (tokenIn != activeV3TokenIn) revert InvalidCallback();
+        _safeTransfer(tokenIn, msg.sender, amountToPay);
     }
 
     /*//////////////////////////////////////////////////////////////
