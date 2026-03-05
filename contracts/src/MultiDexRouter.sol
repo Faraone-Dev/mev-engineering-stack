@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: UNLICENSED
 pragma solidity ^0.8.20;
 
-import {IUniswapV2Pair} from "./interfaces/IUniswapV2.sol";
-import {IUniswapV3Pool} from "./interfaces/IUniswapV3.sol";
+import {IUniswapV2Factory, IUniswapV2Pair} from "./interfaces/IUniswapV2.sol";
+import {IUniswapV3Factory, IUniswapV3Pool} from "./interfaces/IUniswapV3.sol";
 import {IERC20} from "./interfaces/IERC20.sol";
 import {YulUtils} from "./libraries/YulUtils.sol";
 
@@ -17,6 +17,10 @@ contract MultiDexRouter {
     error InvalidPool();
     error InsufficientOutput();
     error Unauthorized();
+    error InvalidInput();
+    error InvalidSwapType();
+    error InvalidCallback();
+    error UntrustedFactory();
 
     /*//////////////////////////////////////////////////////////////
                                CONSTANTS
@@ -33,6 +37,13 @@ contract MultiDexRouter {
     //////////////////////////////////////////////////////////////*/
 
     address public immutable owner;
+    address public trustedV2Factory;
+    address public trustedV3Factory;
+
+    /// @dev Active V3 callback context to prevent direct callback spoofing.
+    address private activeV3Pool;
+    address private activeV3TokenIn;
+    address private activeV3Payer;
 
     /*//////////////////////////////////////////////////////////////
                               CONSTRUCTOR
@@ -40,6 +51,17 @@ contract MultiDexRouter {
 
     constructor() {
         owner = msg.sender;
+    }
+
+    modifier onlyOwner() {
+        if (msg.sender != owner) revert Unauthorized();
+        _;
+    }
+
+    function setTrustedFactories(address v2Factory, address v3Factory) external onlyOwner {
+        if (v2Factory == address(0) || v3Factory == address(0)) revert InvalidInput();
+        trustedV2Factory = v2Factory;
+        trustedV3Factory = v3Factory;
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -55,10 +77,17 @@ contract MultiDexRouter {
         uint256 amountOutMin,
         address to
     ) external returns (uint256 amountOut) {
+        if (pair == address(0) || tokenIn == address(0) || to == address(0) || amountIn == 0) revert InvalidInput();
+
         // Get reserves
         (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
         
         address token0 = IUniswapV2Pair(pair).token0();
+        address token1 = IUniswapV2Pair(pair).token1();
+        if (tokenIn != token0 && tokenIn != token1) revert InvalidPool();
+        address v2Factory = trustedV2Factory;
+        if (v2Factory == address(0)) revert UntrustedFactory();
+        if (IUniswapV2Factory(v2Factory).getPair(token0, token1) != pair) revert InvalidPool();
         bool zeroForOne = tokenIn == token0;
         
         (uint112 reserveIn, uint112 reserveOut) = zeroForOne 
@@ -89,6 +118,10 @@ contract MultiDexRouter {
         uint256 amountOutMin,
         address to
     ) external returns (uint256 amountOut) {
+        if (pairs.length == 0 || tokens.length != pairs.length + 1 || amountIn == 0 || to == address(0)) {
+            revert InvalidInput();
+        }
+
         uint256 len = pairs.length;
         amountOut = amountIn;
         
@@ -104,6 +137,13 @@ contract MultiDexRouter {
             // Get reserves
             (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
             address token0 = IUniswapV2Pair(pair).token0();
+            address token1 = IUniswapV2Pair(pair).token1();
+            if (!((tokenIn == token0 && tokenOut == token1) || (tokenIn == token1 && tokenOut == token0))) {
+                revert InvalidPool();
+            }
+            address v2Factory = trustedV2Factory;
+            if (v2Factory == address(0)) revert UntrustedFactory();
+            if (IUniswapV2Factory(v2Factory).getPair(token0, token1) != pair) revert InvalidPool();
             bool zeroForOne = tokenIn == token0;
             
             (uint112 reserveIn, uint112 reserveOut) = zeroForOne 
@@ -138,7 +178,15 @@ contract MultiDexRouter {
         uint256 amountOutMin,
         address to
     ) external returns (uint256 amountOut) {
+        if (pool == address(0) || tokenIn == address(0) || to == address(0) || amountIn == 0) revert InvalidInput();
+
         address token0 = IUniswapV3Pool(pool).token0();
+        address token1 = IUniswapV3Pool(pool).token1();
+        if (tokenIn != token0 && tokenIn != token1) revert InvalidPool();
+        address v3Factory = trustedV3Factory;
+        if (v3Factory == address(0)) revert UntrustedFactory();
+        uint24 fee = IUniswapV3Pool(pool).fee();
+        if (IUniswapV3Factory(v3Factory).getPool(token0, token1, fee) != pool) revert InvalidPool();
         bool zeroForOne = tokenIn == token0;
         
         // Calculate sqrt price limit
@@ -146,6 +194,10 @@ contract MultiDexRouter {
         
         // Encode callback data
         bytes memory data = abi.encode(tokenIn, msg.sender);
+
+        activeV3Pool = pool;
+        activeV3TokenIn = tokenIn;
+        activeV3Payer = msg.sender;
         
         // Execute swap
         (int256 amount0, int256 amount1) = IUniswapV3Pool(pool).swap(
@@ -155,6 +207,10 @@ contract MultiDexRouter {
             sqrtPriceLimitX96,
             data
         );
+
+        activeV3Pool = address(0);
+        activeV3TokenIn = address(0);
+        activeV3Payer = address(0);
         
         amountOut = uint256(zeroForOne ? -amount1 : -amount0);
         
@@ -168,11 +224,17 @@ contract MultiDexRouter {
         bytes calldata data
     ) external {
         (address tokenIn, address payer) = abi.decode(data, (address, address));
+        if (msg.sender != activeV3Pool) revert InvalidCallback();
+        if (tokenIn != activeV3TokenIn || payer != activeV3Payer) revert InvalidCallback();
         
         uint256 amountToPay = amount0Delta > 0 ? uint256(amount0Delta) : uint256(amount1Delta);
         
-        // Transfer tokens from payer to pool
-        _safeTransferFrom(tokenIn, payer, msg.sender, amountToPay);
+        // Internal flows use direct transfer; external flows use transferFrom.
+        if (payer == address(this)) {
+            _safeTransfer(tokenIn, msg.sender, amountToPay);
+        } else {
+            _safeTransferFrom(tokenIn, payer, msg.sender, amountToPay);
+        }
     }
 
     /*//////////////////////////////////////////////////////////////
@@ -184,6 +246,8 @@ contract MultiDexRouter {
     function executeSwapPath(
         bytes calldata swapData
     ) external returns (uint256 amountOut) {
+        if (swapData.length < 53) revert InvalidInput();
+
         // Decode: [amountIn][tokenIn][numSwaps][[swapType][pool][tokenOut]...]
         uint256 offset = 0;
         
@@ -216,6 +280,8 @@ contract MultiDexRouter {
             } else if (swapType == 2) {
                 // V3 swap
                 currentAmount = _executeV3Swap(pool, currentToken, currentAmount, recipient);
+            } else {
+                revert InvalidSwapType();
             }
             
             currentToken = tokenOut;
@@ -234,8 +300,15 @@ contract MultiDexRouter {
         uint256 amountIn,
         address to
     ) internal returns (uint256 amountOut) {
+        if (pair == address(0) || tokenIn == address(0) || to == address(0) || amountIn == 0) revert InvalidInput();
+
         (uint112 reserve0, uint112 reserve1,) = IUniswapV2Pair(pair).getReserves();
         address token0 = IUniswapV2Pair(pair).token0();
+        address token1 = IUniswapV2Pair(pair).token1();
+        if (tokenIn != token0 && tokenIn != token1) revert InvalidPool();
+        address v2Factory = trustedV2Factory;
+        if (v2Factory == address(0)) revert UntrustedFactory();
+        if (IUniswapV2Factory(v2Factory).getPair(token0, token1) != pair) revert InvalidPool();
         bool zeroForOne = tokenIn == token0;
         
         (uint112 reserveIn, uint112 reserveOut) = zeroForOne 
@@ -259,11 +332,23 @@ contract MultiDexRouter {
         uint256 amountIn,
         address to
     ) internal returns (uint256 amountOut) {
+        if (pool == address(0) || tokenIn == address(0) || to == address(0) || amountIn == 0) revert InvalidInput();
+
         address token0 = IUniswapV3Pool(pool).token0();
+        address token1 = IUniswapV3Pool(pool).token1();
+        if (tokenIn != token0 && tokenIn != token1) revert InvalidPool();
+        address v3Factory = trustedV3Factory;
+        if (v3Factory == address(0)) revert UntrustedFactory();
+        uint24 fee = IUniswapV3Pool(pool).fee();
+        if (IUniswapV3Factory(v3Factory).getPool(token0, token1, fee) != pool) revert InvalidPool();
         bool zeroForOne = tokenIn == token0;
         uint160 sqrtPriceLimitX96 = zeroForOne ? MIN_SQRT_RATIO + 1 : MAX_SQRT_RATIO - 1;
         
         bytes memory data = abi.encode(tokenIn, address(this));
+
+        activeV3Pool = pool;
+        activeV3TokenIn = tokenIn;
+        activeV3Payer = address(this);
         
         (int256 amount0, int256 amount1) = IUniswapV3Pool(pool).swap(
             to,
@@ -272,6 +357,10 @@ contract MultiDexRouter {
             sqrtPriceLimitX96,
             data
         );
+
+        activeV3Pool = address(0);
+        activeV3TokenIn = address(0);
+        activeV3Payer = address(0);
         
         amountOut = uint256(zeroForOne ? -amount1 : -amount0);
     }
@@ -285,6 +374,15 @@ contract MultiDexRouter {
             let success := call(gas(), token, 0, 0x00, 0x44, 0x00, 0x20)
             
             if iszero(success) { revert(0, 0) }
+
+            switch returndatasize()
+            case 0 {}
+            case 0x20 {
+                if iszero(mload(0x00)) { revert(0, 0) }
+            }
+            default {
+                revert(0, 0)
+            }
         }
     }
 
@@ -298,6 +396,15 @@ contract MultiDexRouter {
             let success := call(gas(), token, 0, 0x00, 0x64, 0x00, 0x20)
             
             if iszero(success) { revert(0, 0) }
+
+            switch returndatasize()
+            case 0 {}
+            case 0x20 {
+                if iszero(mload(0x00)) { revert(0, 0) }
+            }
+            default {
+                revert(0, 0)
+            }
         }
     }
 
