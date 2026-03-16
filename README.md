@@ -87,14 +87,12 @@ chmod +x scripts/build.sh
 ./scripts/build.sh
 ```
 
-## 🎯 Why It Impresses Recruiters
+## 🎯 Technical Highlights
 
-This project demonstrates:
-
-- low-latency architecture and performance tradeoffs
-- polyglot systems integration (Rust/Go/C/Solidity)
-- smart-contract and off-chain coordination patterns
-- mature engineering workflow (CI, templates, quality gates)
+- Low-latency architecture and performance tradeoffs
+- Polyglot systems integration (Rust/Go/C/Solidity)
+- Smart-contract and off-chain coordination patterns
+- Mature engineering workflow (CI, templates, quality gates)
 
 ## ⚖️ Responsible Use
 
