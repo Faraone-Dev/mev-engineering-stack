@@ -56,6 +56,11 @@ func NewFlashbots(cfg Config) *Flashbots {
 	}
 }
 
+// Name returns the relay type identifier (implements Relay interface)
+func (f *Flashbots) Name() RelayType {
+	return RelayFlashbots
+}
+
 // Start initializes the relay
 func (f *Flashbots) Start(ctx context.Context) error {
 	log.Info().Msg("Starting Flashbots relay")

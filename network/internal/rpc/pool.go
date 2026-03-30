@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/ethclient"
+	"github.com/mev-protocol/network/internal/metrics"
 	"github.com/rs/zerolog/log"
 )
 
@@ -189,6 +190,7 @@ func (p *Pool) checkHealth(ctx context.Context) {
 
 		if err != nil {
 			client.healthy = false
+			metrics.RPCRequestsTotal.WithLabelValues(client.endpoint, "error").Inc()
 			log.Warn().
 				Str("endpoint", client.endpoint).
 				Err(err).
@@ -196,8 +198,19 @@ func (p *Pool) checkHealth(ctx context.Context) {
 		} else {
 			client.healthy = true
 			client.latency = time.Since(start)
+			metrics.RPCRequestsTotal.WithLabelValues(client.endpoint, "ok").Inc()
+			metrics.RPCLatency.WithLabelValues(client.endpoint).Observe(client.latency.Seconds())
 		}
 	}
+
+	// Count healthy endpoints
+	healthy := 0
+	for _, c := range p.clients {
+		if c.healthy {
+			healthy++
+		}
+	}
+	metrics.RPCHealthyEndpoints.Set(float64(healthy))
 }
 
 // Custom errors

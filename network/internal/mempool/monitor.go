@@ -7,7 +7,9 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/mev-protocol/network/internal/rpc"
+	"github.com/ethereum/go-ethereum/ethclient/gethclient"
+	"github.com/mev-protocol/network/internal/metrics"
+	rpcpool "github.com/mev-protocol/network/internal/rpc"
 	"github.com/rs/zerolog/log"
 )
 
@@ -35,7 +37,7 @@ type PendingTx struct {
 // Monitor watches the mempool for pending transactions
 type Monitor struct {
 	config    Config
-	rpcPool   *rpc.Pool
+	rpcPool   *rpcpool.Pool
 	txChan    chan *PendingTx
 	selectors map[string]bool
 	mu        sync.RWMutex
@@ -44,7 +46,7 @@ type Monitor struct {
 }
 
 // NewMonitor creates a new mempool monitor
-func NewMonitor(cfg Config, pool *rpc.Pool) *Monitor {
+func NewMonitor(cfg Config, pool *rpcpool.Pool) *Monitor {
 	selectors := make(map[string]bool)
 	for _, sel := range cfg.TargetSelectors {
 		selectors[sel] = true
@@ -124,10 +126,16 @@ func (m *Monitor) subscribe(ctx context.Context) error {
 		return err
 	}
 
-	// Subscribe to pending transactions
-	txChan := make(chan *types.Transaction, 1000)
-	sub, err := client.SubscribeNewPendingTransactions(ctx, txChan)
+	// Create a gethclient for pending tx subscription
+	// Access the underlying *rpc.Client via the embedded ethclient
+	rpcClient := client.Client.Client()
+	geth := gethclient.New(rpcClient)
+
+	// Subscribe to pending transaction hashes
+	hashChan := make(chan common.Hash, 1000)
+	sub, err := geth.SubscribePendingTransactions(ctx, hashChan)
 	if err != nil {
+		metrics.MempoolSubscriptionErrors.Inc()
 		return err
 	}
 	defer sub.Unsubscribe()
@@ -140,9 +148,15 @@ func (m *Monitor) subscribe(ctx context.Context) error {
 			return ctx.Err()
 
 		case err := <-sub.Err():
+			metrics.MempoolSubscriptionErrors.Inc()
 			return err
 
-		case tx := <-txChan:
+		case txHash := <-hashChan:
+			// Fetch full transaction by hash
+			tx, _, err := client.TransactionByHash(ctx, txHash)
+			if err != nil {
+				continue
+			}
 			m.handleTransaction(tx)
 		}
 	}
@@ -183,10 +197,14 @@ func (m *Monitor) handleTransaction(tx *types.Transaction) {
 		pendingTx.From = from
 	}
 
+	metrics.MempoolTxReceived.Inc()
+	metrics.MempoolTxFiltered.Inc()
+
 	// Send to channel (non-blocking)
 	select {
 	case m.txChan <- pendingTx:
 	default:
+		metrics.MempoolTxDropped.Inc()
 		log.Warn().Msg("Tx channel full, dropping transaction")
 	}
 }
