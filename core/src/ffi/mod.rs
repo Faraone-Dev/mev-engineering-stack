@@ -7,6 +7,7 @@ use std::ffi::c_void;
 // Re-export hot_path items
 pub use hot_path::{rdtsc_native, TxBuffer, OpportunityQueue, SwapInfo};
 
+#[cfg(has_c_fast_path)]
 #[link(name = "mev_fast", kind = "static")]
 extern "C" {
     // Keccak256

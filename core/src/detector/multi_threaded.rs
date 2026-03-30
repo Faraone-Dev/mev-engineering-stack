@@ -340,8 +340,8 @@ fn calculate_2hop_profit(
     pool2: &PoolState,
     config: &DetectorConfig,
 ) -> Option<Opportunity> {
-    // Get amount out from victim swap (simplified simulation)
-    let victim_out = simulate_swap_out(
+    // Get amount out from the target swap (simplified simulation)
+    let target_out = simulate_swap_out(
         swap.amount_in,
         swap.token_in,
         swap.token_out,
@@ -356,7 +356,7 @@ fn calculate_2hop_profit(
     };
     
     let step1_out = simulate_swap_out(
-        victim_out / 10, // Use 10% of liquidity
+        target_out / 10, // Use 10% of liquidity
         swap.token_out,
         intermediate,
         pool1,
@@ -371,7 +371,7 @@ fn calculate_2hop_profit(
     )?;
     
     // Calculate profit
-    let input_amount = victim_out / 10;
+    let input_amount = target_out / 10;
     if step2_out <= input_amount {
         return None;
     }
@@ -458,7 +458,7 @@ mod tests {
             token0: Address::zero(),
             token1: Address::repeat_byte(1),
             reserve0: U256::from(1_000_000_000_000_000_000u64), // 1 ETH
-            reserve1: U256::from(2000_000_000_000_000_000_000u64), // 2000 tokens
+            reserve1: U256::from(2000u64) * U256::from(1_000_000_000_000_000_000u64), // 2000 tokens
             fee: 30, // 0.3%
             dex_type: DexType::UniswapV2,
             last_update: 0,

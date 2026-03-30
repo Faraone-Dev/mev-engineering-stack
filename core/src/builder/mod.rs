@@ -1,10 +1,31 @@
-//! Bundle Builder module
+//! Bundle Builder — constructs Flashbots-compatible bundles from opportunities
+//!
+//! Converts detected MEV opportunities into signed transaction bundles
+//! ready for relay submission. Each opportunity type has a bespoke
+//! encoding strategy targeting the on-chain executor contracts.
 
 use crate::config::Config;
-use crate::types::{Bundle, BundleTransaction, Opportunity, OpportunityType};
+use crate::types::{Bundle, BundleTransaction, Opportunity, OpportunityType, DexType};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{info, debug};
+
+/// Solidity function selectors for executor contract
+mod selectors {
+    /// executeArbitrage(address token, uint256 amount, bytes swapPath)
+    pub const EXECUTE_ARBITRAGE: [u8; 4] = [0xa0, 0x71, 0x2d, 0x68];
+    /// executeBackrun(address token, uint256 amount, bytes swapData)
+    pub const EXECUTE_BACKRUN: [u8; 4] = [0x5a, 0xf0, 0x6f, 0xed];
+    /// executeLiquidation(address debtToken, address collToken, uint256 amount, address user)
+    pub const EXECUTE_LIQUIDATION: [u8; 4] = [0xd4, 0xe8, 0xbe, 0x83];
+}
+
+/// DEX type identifiers used in swap path encoding
+const DEX_UNISWAP_V2: u8 = 0x01;
+const DEX_UNISWAP_V3: u8 = 0x02;
+const DEX_SUSHISWAP: u8  = 0x03;
+const DEX_CURVE: u8       = 0x04;
+const DEX_BALANCER: u8    = 0x05;
 
 /// Bundle builder for MEV extraction
 pub struct BundleBuilder {
@@ -28,16 +49,17 @@ impl BundleBuilder {
     }
 
     pub async fn stop(&self) -> anyhow::Result<()> {
-        info!("Bundle builder stopped");
+        let built = self.count.load(Ordering::Relaxed);
+        info!(bundles_built = built, "Bundle builder stopped");
         Ok(())
     }
 
-    /// Set the contract address for bundle execution
+    /// Set the on-chain executor contract address
     pub fn set_contract(&mut self, address: String) {
         self.contract_address = Some(address);
     }
 
-    /// Build a bundle from an opportunity
+    /// Build a bundle from a detected opportunity
     pub async fn build(&self, opportunity: &Opportunity) -> anyhow::Result<Bundle> {
         let contract = self.contract_address.as_ref()
             .ok_or_else(|| anyhow::anyhow!("Contract address not set"))?;
@@ -46,10 +68,16 @@ impl BundleBuilder {
             OpportunityType::Arbitrage => self.build_arbitrage_bundle(opportunity, contract)?,
             OpportunityType::Backrun => self.build_backrun_bundle(opportunity, contract)?,
             OpportunityType::Liquidation => self.build_liquidation_bundle(opportunity, contract)?,
-            OpportunityType::Sandwich => self.build_sandwich_bundle(opportunity, contract)?,
         };
 
         self.count.fetch_add(1, Ordering::Relaxed);
+
+        debug!(
+            kind = ?opportunity.opportunity_type,
+            txs = transactions.len(),
+            gas = opportunity.gas_estimate,
+            "Bundle built"
+        );
 
         Ok(Bundle {
             transactions,
@@ -61,18 +89,18 @@ impl BundleBuilder {
         })
     }
 
+    /// Arbitrage bundle: single flash-loan tx that executes the full arb path
     fn build_arbitrage_bundle(
-        &self, 
+        &self,
         opportunity: &Opportunity,
         contract: &str,
     ) -> anyhow::Result<Vec<BundleTransaction>> {
-        // Build calldata for FlashArbitrage.executeArbitrage
-        let swap_data = self.encode_swap_path(opportunity)?;
-        
-        let calldata = self.encode_execute_arbitrage(
+        let swap_path = self.encode_swap_path(&opportunity.path)?;
+
+        let calldata = encode_arbitrage_call(
             &opportunity.token_in,
             opportunity.amount_in,
-            &swap_data,
+            &swap_path,
         )?;
 
         Ok(vec![BundleTransaction {
@@ -87,46 +115,41 @@ impl BundleBuilder {
         }])
     }
 
+    /// Backrun bundle: execute immediately after target tx
     fn build_backrun_bundle(
         &self,
         opportunity: &Opportunity,
         contract: &str,
     ) -> anyhow::Result<Vec<BundleTransaction>> {
-        // Include target transaction first (if available)
-        let mut txs = Vec::new();
+        let swap_path = self.encode_swap_path(&opportunity.path)?;
 
-        // Our backrun transaction
-        let swap_data = self.encode_swap_path(opportunity)?;
-        let calldata = self.encode_execute_arbitrage(
+        let calldata = encode_backrun_call(
             &opportunity.token_in,
             opportunity.amount_in,
-            &swap_data,
+            &swap_path,
         )?;
 
-        txs.push(BundleTransaction {
+        Ok(vec![BundleTransaction {
             to: contract.to_string(),
             value: 0,
             gas_limit: opportunity.gas_estimate,
             gas_price: None,
             max_fee_per_gas: None,
-            max_priority_fee_per_gas: Some(2_000_000_000), // Higher tip for backrun
+            max_priority_fee_per_gas: Some(2_000_000_000), // 2 gwei — higher for backrun priority
             data: calldata,
             nonce: None,
-        });
-
-        Ok(txs)
+        }])
     }
 
+    /// Liquidation bundle: flash borrow → repay debt → receive collateral
     fn build_liquidation_bundle(
         &self,
         opportunity: &Opportunity,
         contract: &str,
     ) -> anyhow::Result<Vec<BundleTransaction>> {
-        // Flash loan -> Repay debt -> Receive collateral -> Swap collateral -> Repay flash loan
-        
-        let calldata = self.encode_liquidation(
-            &opportunity.token_in,
-            &opportunity.token_out,
+        let calldata = encode_liquidation_call(
+            &opportunity.token_in,   // debt token
+            &opportunity.token_out,  // collateral token
             opportunity.amount_in,
         )?;
 
@@ -142,123 +165,214 @@ impl BundleBuilder {
         }])
     }
 
-    fn build_sandwich_bundle(
-        &self,
-        opportunity: &Opportunity,
-        contract: &str,
-    ) -> anyhow::Result<Vec<BundleTransaction>> {
-        // Frontrun -> Target -> Backrun
-        let mut txs = Vec::new();
+    /// Encode the multi-hop swap path for the executor contract
+    ///
+    /// Wire format per hop: [dex_type:1][pool_address:20][fee:3]
+    fn encode_swap_path(&self, path: &[DexType]) -> anyhow::Result<Vec<u8>> {
+        let mut data = Vec::with_capacity(path.len() * 24);
 
-        // Frontrun transaction
-        let frontrun_data = self.encode_swap_path(opportunity)?;
-        txs.push(BundleTransaction {
-            to: contract.to_string(),
-            value: 0,
-            gas_limit: 150_000,
-            gas_price: None,
-            max_fee_per_gas: None,
-            max_priority_fee_per_gas: Some(10_000_000_000), // High tip for frontrun
-            data: frontrun_data.clone(),
-            nonce: None,
-        });
+        for (i, dex) in path.iter().enumerate() {
+            let (dex_byte, fee_bytes) = match dex {
+                DexType::UniswapV2  => (DEX_UNISWAP_V2, [0x00, 0x0B, 0xB8]),  // 3000 = 0x0BB8
+                DexType::UniswapV3  => (DEX_UNISWAP_V3, [0x00, 0x01, 0xF4]),  // 500  = 0x01F4
+                DexType::SushiSwap  => (DEX_SUSHISWAP,  [0x00, 0x0B, 0xB8]),
+                DexType::Curve      => (DEX_CURVE,       [0x00, 0x00, 0x04]),  // pool index
+                DexType::Balancer   => (DEX_BALANCER,    [0x00, 0x00, 0x00]),  // pool ID in data
+            };
 
-        // Note: Target TX would be included by the bundle relay
-
-        // Backrun transaction
-        txs.push(BundleTransaction {
-            to: contract.to_string(),
-            value: 0,
-            gas_limit: 150_000,
-            gas_price: None,
-            max_fee_per_gas: None,
-            max_priority_fee_per_gas: Some(1_000_000_000),
-            data: frontrun_data, // Reverse swap
-            nonce: None,
-        });
-
-        Ok(txs)
-    }
-
-    fn encode_swap_path(&self, opportunity: &Opportunity) -> anyhow::Result<Vec<u8>> {
-        // Encode swap path for the contract
-        // Format: [swapCount][swapType][target][params]...
-        
-        let mut data = Vec::new();
-        data.push(opportunity.path.len() as u8);
-        
-        for dex in &opportunity.path {
-            // Swap type
-            data.push(match dex {
-                crate::types::DexType::UniswapV2 => 1,
-                crate::types::DexType::UniswapV3 => 2,
-                crate::types::DexType::SushiSwap => 1,
-                crate::types::DexType::Curve => 3,
-                crate::types::DexType::Balancer => 4,
-            });
-            
-            // Target address (placeholder)
+            data.push(dex_byte);
+            // Pool address placeholder — real address comes from pool cache
             data.extend_from_slice(&[0u8; 20]);
-            
-            // Params (placeholder)
-            data.extend_from_slice(&[0u8; 32]);
+            data.extend_from_slice(&fee_bytes);
         }
 
         Ok(data)
     }
 
-    fn encode_execute_arbitrage(
-        &self,
-        token: &str,
-        amount: u128,
-        swap_data: &[u8],
-    ) -> anyhow::Result<Vec<u8>> {
-        // Function selector: executeArbitrage(address,uint256,bytes)
-        let selector = [0x12, 0x34, 0x56, 0x78]; // Placeholder
-        
-        let mut calldata = selector.to_vec();
-        
-        // Encode token address (32 bytes, right-padded)
-        calldata.extend_from_slice(&[0u8; 12]);
-        if let Ok(bytes) = hex::decode(token.trim_start_matches("0x")) {
-            calldata.extend_from_slice(&bytes);
-        } else {
-            calldata.extend_from_slice(&[0u8; 20]);
-        }
-        
-        // Encode amount (32 bytes)
-        calldata.extend_from_slice(&amount.to_be_bytes());
-        calldata.extend_from_slice(&[0u8; 16]);
-        
-        // Encode swap data offset and data
-        calldata.extend_from_slice(&[0u8; 28]);
-        calldata.extend_from_slice(&(96u32).to_be_bytes());
-        
-        calldata.extend_from_slice(&[0u8; 28]);
-        calldata.extend_from_slice(&(swap_data.len() as u32).to_be_bytes());
-        
-        calldata.extend_from_slice(swap_data);
-
-        Ok(calldata)
-    }
-
-    fn encode_liquidation(
-        &self,
-        debt_token: &str,
-        collateral_token: &str,
-        amount: u128,
-    ) -> anyhow::Result<Vec<u8>> {
-        // Placeholder liquidation encoding
-        let selector = [0xab, 0xcd, 0xef, 0x12];
-        let mut calldata = selector.to_vec();
-        
-        // Add parameters...
-        calldata.extend_from_slice(&[0u8; 64]);
-        
-        Ok(calldata)
-    }
-
     pub async fn count(&self) -> u64 {
         self.count.load(Ordering::Relaxed)
+    }
+}
+
+// ─── ABI encoding helpers ──────────────────────────────────────
+
+/// Encode executeArbitrage(address token, uint256 amount, bytes swapPath)
+fn encode_arbitrage_call(
+    token: &str,
+    amount: u128,
+    swap_data: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut calldata = Vec::with_capacity(4 + 32 * 4 + swap_data.len());
+
+    // Selector
+    calldata.extend_from_slice(&selectors::EXECUTE_ARBITRAGE);
+
+    // Param 1: address token (left-padded to 32 bytes)
+    calldata.extend_from_slice(&abi_encode_address(token));
+
+    // Param 2: uint256 amount
+    calldata.extend_from_slice(&abi_encode_u256(amount));
+
+    // Param 3: bytes offset (dynamic — points past fixed params)
+    calldata.extend_from_slice(&abi_encode_u256(96)); // 3 * 32
+
+    // Dynamic: length + data
+    calldata.extend_from_slice(&abi_encode_u256(swap_data.len() as u128));
+    calldata.extend_from_slice(swap_data);
+    // Pad to 32-byte boundary
+    let pad = (32 - swap_data.len() % 32) % 32;
+    calldata.extend(std::iter::repeat(0u8).take(pad));
+
+    Ok(calldata)
+}
+
+/// Encode executeBackrun(address token, uint256 amount, bytes swapData)
+fn encode_backrun_call(
+    token: &str,
+    amount: u128,
+    swap_data: &[u8],
+) -> anyhow::Result<Vec<u8>> {
+    let mut calldata = Vec::with_capacity(4 + 32 * 4 + swap_data.len());
+
+    calldata.extend_from_slice(&selectors::EXECUTE_BACKRUN);
+    calldata.extend_from_slice(&abi_encode_address(token));
+    calldata.extend_from_slice(&abi_encode_u256(amount));
+    calldata.extend_from_slice(&abi_encode_u256(96));
+    calldata.extend_from_slice(&abi_encode_u256(swap_data.len() as u128));
+    calldata.extend_from_slice(swap_data);
+    let pad = (32 - swap_data.len() % 32) % 32;
+    calldata.extend(std::iter::repeat(0u8).take(pad));
+
+    Ok(calldata)
+}
+
+/// Encode executeLiquidation(address debtToken, address collToken, uint256 amount, address user)
+fn encode_liquidation_call(
+    debt_token: &str,
+    collateral_token: &str,
+    amount: u128,
+) -> anyhow::Result<Vec<u8>> {
+    let mut calldata = Vec::with_capacity(4 + 32 * 4);
+
+    calldata.extend_from_slice(&selectors::EXECUTE_LIQUIDATION);
+    calldata.extend_from_slice(&abi_encode_address(debt_token));
+    calldata.extend_from_slice(&abi_encode_address(collateral_token));
+    calldata.extend_from_slice(&abi_encode_u256(amount));
+    // User address (zero = liquidate any matching position)
+    calldata.extend_from_slice(&[0u8; 32]);
+
+    Ok(calldata)
+}
+
+/// ABI-encode an address into a 32-byte word (left-padded with zeros)
+fn abi_encode_address(addr: &str) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    let hex_str = addr.strip_prefix("0x").unwrap_or(addr);
+    if let Ok(bytes) = hex::decode(hex_str) {
+        let len = bytes.len().min(20);
+        word[32 - len..32].copy_from_slice(&bytes[..len]);
+    }
+    word
+}
+
+/// ABI-encode a u128 into a 32-byte word (big-endian, left-padded)
+fn abi_encode_u256(val: u128) -> [u8; 32] {
+    let mut word = [0u8; 32];
+    word[16..32].copy_from_slice(&val.to_be_bytes());
+    word
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_abi_encode_address() {
+        let addr = "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2"; // WETH
+        let encoded = abi_encode_address(addr);
+        // First 12 bytes should be zero padding
+        assert_eq!(&encoded[..12], &[0u8; 12]);
+        // Last 20 bytes should be the address
+        assert_eq!(encoded[12], 0xC0);
+    }
+
+    #[test]
+    fn test_abi_encode_u256() {
+        let val = 1_000_000_000_000_000_000u128; // 1e18
+        let encoded = abi_encode_u256(val);
+        assert_eq!(&encoded[..16], &[0u8; 16]); // first 16 bytes zero
+        assert_eq!(
+            u128::from_be_bytes(encoded[16..32].try_into().unwrap()),
+            val
+        );
+    }
+
+    #[test]
+    fn test_encode_arbitrage_call() {
+        let swap_data = {
+            let mut v = vec![DEX_UNISWAP_V2];
+            v.extend_from_slice(&[0x00; 23]);
+            v
+        }; // 24-byte path
+        let calldata = encode_arbitrage_call(
+            "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2",
+            1_000_000_000_000_000_000,
+            &swap_data,
+        ).unwrap();
+
+        // Check selector
+        assert_eq!(&calldata[0..4], &selectors::EXECUTE_ARBITRAGE);
+        // Check total length: 4 + 32*3 (fixed) + 32 (len) + 32 (padded data) = 164
+        assert!(calldata.len() >= 164);
+    }
+
+    #[test]
+    fn test_encode_liquidation_call() {
+        let calldata = encode_liquidation_call(
+            "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48", // USDC
+            "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2", // WETH
+            50_000_000_000_000_000_000,
+        ).unwrap();
+
+        assert_eq!(&calldata[0..4], &selectors::EXECUTE_LIQUIDATION);
+        assert_eq!(calldata.len(), 4 + 32 * 4); // fixed params only
+    }
+
+    #[tokio::test]
+    async fn test_build_arbitrage_bundle() {
+        let config = Arc::new(Config::default());
+        let mut builder = BundleBuilder::new(config);
+        builder.set_contract("0x1234567890123456789012345678901234567890".to_string());
+
+        let opp = Opportunity {
+            opportunity_type: OpportunityType::Arbitrage,
+            token_in: "0xC02aaA39b223FE8D0A0e5C4F27eAD9083C756Cc2".to_string(),
+            token_out: "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48".to_string(),
+            amount_in: 5_000_000_000_000_000_000,
+            expected_profit: 50_000_000_000_000_000,
+            gas_estimate: 250_000,
+            deadline: 100,
+            path: vec![DexType::UniswapV2, DexType::UniswapV3],
+            target_tx: None,
+        };
+
+        let bundle = builder.build(&opp).await.unwrap();
+        assert_eq!(bundle.transactions.len(), 1);
+        assert_eq!(bundle.transactions[0].gas_limit, 250_000);
+        assert!(!bundle.transactions[0].data.is_empty());
+    }
+
+    #[test]
+    fn test_encode_swap_path() {
+        let config = Arc::new(Config::default());
+        let builder = BundleBuilder::new(config);
+
+        let path = vec![DexType::UniswapV2, DexType::UniswapV3];
+        let encoded = builder.encode_swap_path(&path).unwrap();
+
+        // 2 hops × 24 bytes each = 48
+        assert_eq!(encoded.len(), 48);
+        assert_eq!(encoded[0], DEX_UNISWAP_V2);
+        assert_eq!(encoded[24], DEX_UNISWAP_V3);
     }
 }
