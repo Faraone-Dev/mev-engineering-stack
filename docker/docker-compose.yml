@@ -14,8 +14,9 @@ version: "3.9"
 #   docker compose down            # stop and remove
 #
 # Metrics endpoints:
-#   mev-engine  → :9090/metrics
-#   mev-node    → :9091/metrics
+#   mev-engine  → :9090/metrics  (planned — Rust metrics not yet wired)
+#   mev-node    → :9091/metrics  (live — dashboard polls this)
+#   prometheus  → :9090           (query API + UI)
 #   grafana     → :3000 (admin/mev_admin)
 
 services:
@@ -59,9 +60,12 @@ services:
     restart: unless-stopped
     environment:
       - CONFIG_PATH=/app/config/chains.json
+      - MEV_METRICS_ADDR=:9091         # metrics port (matches prometheus.yml target)
     volumes:
       - ./config:/app/config:ro
       - ./logs:/app/logs
+    ports:
+      - "9091:9091"                    # metrics endpoint for dashboard + Prometheus
     networks:
       - mev-network
     depends_on:
@@ -79,6 +83,8 @@ services:
     command:
       - '--config.file=/etc/prometheus/prometheus.yml'
       - '--storage.tsdb.path=/prometheus'
+    ports:
+      - "9090:9090"                    # Prometheus UI + query API
     networks:
       - mev-network
 
@@ -101,7 +107,7 @@ services:
       - prometheus
 
 # All services communicate over this internal bridge network.
-# No ports are exposed to the host except Grafana (3000).
+# Exposed ports: Grafana (3000), mev-node metrics (9091), Prometheus (9090).
 networks:
   mev-network:
     driver: bridge
