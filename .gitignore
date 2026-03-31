@@ -29,6 +29,7 @@ contracts/broadcast/
 # Environment
 .env
 .env.local
+.env.testnet
 .env.*.local
 config/.env
 config/*.local

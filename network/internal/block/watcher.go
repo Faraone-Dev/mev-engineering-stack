@@ -6,7 +6,8 @@ import (
 	"sync"
 	"time"
 
-	ethtypes "github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/mev-protocol/network/internal/mempool"
 	"github.com/mev-protocol/network/internal/metrics"
 	"github.com/mev-protocol/network/internal/rpc"
 	"github.com/rs/zerolog/log"
@@ -39,6 +40,7 @@ type Watcher struct {
 	rpcPool *rpc.Pool
 
 	headerChan chan *Header
+	txChan     chan *mempool.PendingTx // block-based tx feed for chains without public mempool
 	latest     *Header
 
 	mu      sync.RWMutex
@@ -52,7 +54,14 @@ func NewWatcher(cfg Config, pool *rpc.Pool) *Watcher {
 		config:     cfg,
 		rpcPool:    pool,
 		headerChan: make(chan *Header, cfg.BufferSize),
+		txChan:     make(chan *mempool.PendingTx, 10000),
 	}
+}
+
+// BlockTxChan returns the channel of transactions extracted from blocks.
+// Use this as a secondary feed on chains without a public mempool (e.g. Arbitrum).
+func (w *Watcher) BlockTxChan() <-chan *mempool.PendingTx {
+	return w.txChan
 }
 
 // Start begins watching for new blocks
@@ -135,7 +144,7 @@ func (w *Watcher) subscribe(ctx context.Context) error {
 		return err
 	}
 
-	headerChan := make(chan *ethtypes.Header, 16)
+	headerChan := make(chan *types.Header, 16)
 	sub, err := client.SubscribeNewHead(ctx, headerChan)
 	if err != nil {
 		// Fallback to polling if subscription not supported
@@ -195,7 +204,7 @@ func (w *Watcher) pollHeaders(ctx context.Context) error {
 	}
 }
 
-func (w *Watcher) handleHeader(ethHeader *ethtypes.Header) {
+func (w *Watcher) handleHeader(ethHeader *types.Header) {
 	observedAt := time.Now()
 
 	header := &Header{
@@ -260,4 +269,60 @@ func (w *Watcher) handleHeader(ethHeader *ethtypes.Header) {
 	default:
 		log.Warn().Uint64("block", header.Number).Msg("Header channel full")
 	}
+
+	// Fetch full block body and extract transactions.
+	// This is the primary tx feed on chains without a public mempool (Arbitrum, Optimism).
+	go w.scanBlockTxs(header.Number)
+}
+
+// scanBlockTxs fetches the full block and pushes every transaction to txChan.
+func (w *Watcher) scanBlockTxs(blockNumber uint64) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	client, err := w.rpcPool.GetClient()
+	if err != nil {
+		log.Warn().Err(err).Uint64("block", blockNumber).Msg("No RPC client for block scan")
+		return
+	}
+
+	block, err := client.BlockByNumber(ctx, new(big.Int).SetUint64(blockNumber))
+	if err != nil {
+		log.Warn().Err(err).Uint64("block", blockNumber).Msg("Failed to fetch block body")
+		return
+	}
+
+	txs := block.Transactions()
+	if len(txs) == 0 {
+		return
+	}
+
+	chainID := txs[0].ChainId()
+	signer := types.LatestSignerForChainID(chainID)
+
+	for _, tx := range txs {
+		ptx := &mempool.PendingTx{
+			Hash:      tx.Hash(),
+			To:        tx.To(),
+			Value:     tx.Value().Uint64(),
+			GasPrice:  tx.GasPrice().Uint64(),
+			GasLimit:  tx.Gas(),
+			Input:     tx.Data(),
+			Nonce:     tx.Nonce(),
+			Timestamp: time.Now(),
+		}
+		if from, err := types.Sender(signer, tx); err == nil {
+			ptx.From = from
+		}
+
+		select {
+		case w.txChan <- ptx:
+		default:
+			// channel full — skip remaining txs from this block
+			log.Warn().Uint64("block", blockNumber).Int("dropped", len(txs)).Msg("Block tx channel full")
+			return
+		}
+	}
+
+	log.Info().Uint64("block", blockNumber).Int("txs", len(txs)).Msg("Block txs fed to pipeline")
 }

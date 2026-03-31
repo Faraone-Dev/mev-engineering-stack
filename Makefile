@@ -1,4 +1,4 @@
-.PHONY: all build test clean docker deploy lint fmt ci-local help
+.PHONY: all build test clean docker deploy lint fmt ci-local live help
 
 # Default target
 all: build
@@ -31,6 +31,16 @@ lint:
 # Local CI parity
 ci-local: build test lint
 
+# Launch full stack live (Go node + Rust engine + Dashboard)
+live:
+	@powershell -ExecutionPolicy Bypass -File scripts/live.ps1
+
+live-testnet:
+	@powershell -ExecutionPolicy Bypass -File scripts/live.ps1 -Network testnet
+
+live-build:
+	@powershell -ExecutionPolicy Bypass -File scripts/live.ps1 -BuildFirst
+
 # Help
 help:
 	@echo "Available targets:"
@@ -39,6 +49,9 @@ help:
 	@echo "  make fmt        - Run format checks"
 	@echo "  make lint       - Run lint checks"
 	@echo "  make ci-local   - Run build + test + lint"
+	@echo "  make live        - Launch full stack (Go + Rust + Dashboard)"
+	@echo "  make live-testnet- Launch on Arbitrum Sepolia"
+	@echo "  make live-build  - Build first, then launch"
 	@echo "  make clean      - Clean build artifacts"
 	@echo "  make docker     - Build Docker images"
 

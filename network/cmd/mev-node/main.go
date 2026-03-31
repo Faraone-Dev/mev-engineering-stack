@@ -80,7 +80,12 @@ func main() {
 	blockWatcher := block.NewWatcher(cfg.Block, rpcPool)
 	gasOracle := gas.NewOracle(cfg.Gas, rpcPool, blockWatcher)
 	mempoolMonitor := mempool.NewMonitor(cfg.Mempool, rpcPool)
-	txPipeline := pipeline.NewPipeline(cfg.Pipeline, mempoolMonitor.TxChan())
+
+	// Merge tx feeds: mempool pending txs + block-extracted txs.
+	// On chains without a public mempool (Arbitrum, Optimism) the mempool
+	// channel is effectively empty, so the block-based feed is the primary source.
+	mergedTxChan := mergeTxChans(mempoolMonitor.TxChan(), blockWatcher.BlockTxChan())
+	txPipeline := pipeline.NewPipeline(cfg.Pipeline, mergedTxChan)
 
 	// Initialize relay layer
 	flashbotsRelay := relay.NewFlashbots(cfg.Relay)
@@ -258,4 +263,17 @@ func consumePipelineMonitorOnly(
 			logEvent.Msg("Classified tx (monitor-only, Rust core offline)")
 		}
 	}
+}
+
+// mergeTxChans fans-in two PendingTx channels into one.
+func mergeTxChans(a, b <-chan *mempool.PendingTx) <-chan *mempool.PendingTx {
+	out := make(chan *mempool.PendingTx, 10000)
+	forward := func(ch <-chan *mempool.PendingTx) {
+		for tx := range ch {
+			out <- tx
+		}
+	}
+	go forward(a)
+	go forward(b)
+	return out
 }
