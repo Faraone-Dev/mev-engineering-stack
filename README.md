@@ -417,6 +417,16 @@ Flags: `--key` (reuse signing key), `--rpc` (custom RPC), `--submit` (live submi
 | `proptest` | 23 | Constant-product invariants (7), ABI roundtrip (3), gas bounds (5), keccak (3), data structures (2), swap selectors (1), overflow safety (2) |
 | `integration` | 10 | Full pipeline end-to-end, engine lifecycle, all bundle types, simulator count |
 
+### CI/CD
+
+GitHub Actions pipeline with **3 parallel jobs** — each layer builds and tests independently:
+
+| Job | Steps | Toolchain |
+|-----|-------|-----------|
+| **Rust Core** | `cargo fmt --check` → `cargo clippy -D warnings` → `cargo test` → `cargo build --release` | `dtolnay/rust-toolchain@stable` + `rust-cache` |
+| **Go Network** | `go vet` → `go test ./...` → `go build ./cmd/mev-node` | Go 1.21 |
+| **Solidity Contracts** | `forge build` → `forge test -vv` | Foundry nightly |
+
 ### Bugs Found & Fixed
 
 | Bug | Severity | Module | Fix |
