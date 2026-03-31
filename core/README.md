@@ -25,10 +25,10 @@ Release profile: `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`,
            ┌────────────────┐    ┌──────────────────┐   ┌─────────────────┐
            │ Detector       │    │ EvmSimulator     │   │ BundleBuilder   │
            │                │    │                  │   │                 │
-           │ Arbitrage      │───▶│ constant_product │──▶│ encode_arb_call │
-           │ Backrun        │    │ revm fork sim    │   │ encode_liq_call │
-           │ Liquidation    │    │ gas estimation   │   │ swap_path encode│
-           │ MultiThreaded  │    │                  │   │ Flashbots format│
+           │ Arbitrage      │───▶│ V2 const_product │──▶│ encode_arb_call │
+           │ Backrun        │    │ V3 concentrated  │   │ encode_liq_call │
+           │ Liquidation    │    │ auto-route by    │   │ swap_path encode│
+           │ MultiThreaded  │    │ pool type        │   │ Flashbots format│
            └────────┬───────┘    └──────────────────┘   └─────────────────┘
                     │
                     │ FFI (optional)
@@ -50,14 +50,17 @@ Release profile: `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`,
 | ├ liquidation | `detector/liquidation.rs` | Under-collateralized position liquidation (Aave V3, Compound V3, Morpho) |
 | └ multi_threaded | `detector/multi_threaded.rs` | Parallel worker pool with crossbeam channels |
 | **simulator** | `src/simulator/` | EVM simulation |
-| | | Constant-product x·y=k fast filter (35 ns) + revm 8.0 fork validation |
+| | | V2 constant-product x·y=k fast filter (35 ns) + V3 concentrated liquidity swap (`sqrtPriceX96` → virtual reserves, auto-routing by `is_v3` flag) + revm 8.0 fork validation. Checked arithmetic on all paths. |
 | **builder** | `src/builder/` | Bundle construction |
 | | | ABI encoding, swap path packing, gas pricing, Flashbots-compatible format |
 | **grpc** | `src/grpc/` | gRPC server (tonic 0.11) |
-| | | `DetectOpportunity`, `StreamOpportunities`, `GetStatus` RPCs |
-| **ffi** | `src/ffi/` | C FFI bindings |
-| | | Keccak-256, RLP, SIMD utilities, lock-free queue (graceful Rust fallback) |
-| **arbitrum** | `src/arbitrum/` | Arbitrum-specific detection + pool management |
+| | | `DetectOpportunity` (unary: classify → detect → simulate → build), `StreamOpportunities` (server-streaming via `tokio::broadcast` with `min_profit` filter + lag recovery), `GetStatus` (uptime + detection count) |
+| **ffi** | `src/ffi/` | C FFI bindings with pure-Rust fallback |
+| | | Keccak-256 (alignment-safe), RLP, SIMD batch price impact (`__uint128_t`), lock-free queue (CAS slot-claim), arena allocator. **Graceful degradation**: compiles and runs without C toolchain via Rust fallback implementations. |
+| **arbitrum** | `src/arbitrum/` | Arbitrum L2 engine (~1700 lines) |
+| | | **Pool discovery**: 3 DEX (Uniswap V3, SushiSwap, Camelot), 24 token pairs, all V3 fee tiers (100/500/3000/10000), `sqrtPriceX96` → virtual reserve conversion, parallel refresh via `join_all` |
+| | | **Detection**: 2-hop + triangular arbitrage, binary search for optimal amount (64 iterations), gas estimation per DEX type, near-miss debug logging |
+| | | **Execution**: Balancer V2 flash loan executor, EIP-1559 signing (chain_id=42161), pre-send simulation, slippage protection, multi-DEX calldata encoding |
 | **mempool** | `src/mempool/` | WebSocket ultra-latency transaction polling |
 | **config** | `src/config.rs` | Typed configuration with chain/strategy/performance sections |
 | **types** | `src/types.rs` | Shared pipeline types: `PendingTx → SwapInfo → Opportunity → SimulationResult → Bundle` |

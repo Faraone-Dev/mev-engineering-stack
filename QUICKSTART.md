@@ -86,6 +86,29 @@ make ci-local
 
 ## 5) Run binaries
 
+### Integrated stack launcher (recommended on Windows)
+
+```powershell
+.\scripts\live.ps1 -ExecutionMode simulate
+```
+
+For signed relay submission instead of read-only mode:
+
+```powershell
+.\scripts\live.ps1 -ExecutionMode live
+```
+
+Live mode requires these environment variables:
+
+- `PRIVATE_KEY` (EOA used to sign executor transaction)
+- `FLASHBOTS_SIGNING_KEY` (bundle auth signature key)
+
+Optional performance toggle (auto-falls back to Rust path if C fast-path is unavailable):
+
+- `MEV_USE_FFI=1`
+
+This starts the Rust gRPC core (`grpc_server`), the Go network node, and the dashboard wiring in the correct order.
+
 ### Rust engine
 
 ```bash

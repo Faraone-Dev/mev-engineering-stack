@@ -47,8 +47,16 @@ extern "C" {
 /// Safe wrapper for Keccak256
 pub fn keccak256(input: &[u8]) -> [u8; 32] {
     let mut output = [0u8; 32];
+
+    #[cfg(has_c_fast_path)]
+    if use_c_fast_path() {
+        unsafe {
+            mev_keccak256(input.as_ptr(), input.len(), output.as_mut_ptr());
+        }
+        return output;
+    }
     
-    // For now, use Rust implementation
+    // Default path uses Rust Keccak for portability; C fast-path remains available behind FFI.
     use sha3::{Digest, Keccak256 as K256};
     let mut hasher = K256::new();
     hasher.update(input);
@@ -59,7 +67,17 @@ pub fn keccak256(input: &[u8]) -> [u8; 32] {
 
 /// Safe wrapper for RLP encoding
 pub fn rlp_encode(input: &[u8]) -> Vec<u8> {
-    // Simplified RLP encoding
+    #[cfg(has_c_fast_path)]
+    if use_c_fast_path() {
+        let mut out = vec![0u8; input.len().saturating_add(16)];
+        let written = unsafe { mev_rlp_encode_string(input.as_ptr(), input.len(), out.as_mut_ptr()) };
+        if written > 0 && written <= out.len() {
+            out.truncate(written);
+            return out;
+        }
+    }
+
+    // Minimal byte-string RLP encoder used by current call sites.
     if input.len() == 1 && input[0] < 0x80 {
         input.to_vec()
     } else if input.len() < 56 {
@@ -79,6 +97,17 @@ fn to_be_bytes(n: usize) -> Vec<u8> {
     let bytes = n.to_be_bytes();
     let start = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len() - 1);
     bytes[start..].to_vec()
+}
+
+#[cfg(has_c_fast_path)]
+fn use_c_fast_path() -> bool {
+    match std::env::var("MEV_USE_FFI") {
+        Ok(v) => {
+            let normalized = v.trim().to_ascii_lowercase();
+            matches!(normalized.as_str(), "1" | "true" | "yes" | "on")
+        }
+        Err(_) => false,
+    }
 }
 
 #[cfg(test)]

@@ -18,9 +18,9 @@ service MevEngine {
 
 | RPC | Direction | Description |
 |-----|-----------|-------------|
-| `DetectOpportunity` | Unary | Single classified tx → detection result |
-| `StreamOpportunities` | Server-streaming | Subscribe to all opportunities in real time |
-| `GetStatus` | Unary | Engine health, uptime, detection count |
+| `DetectOpportunity` | Unary | Single classified tx → full pipeline (detect + simulate + build) → detection result |
+| `StreamOpportunities` | Server-streaming | Subscribe to opportunities in real time via `tokio::broadcast` channel. Supports `min_profit` threshold filter. Handles subscriber lag gracefully. |
+| `GetStatus` | Unary | Engine health, uptime (tracked via `Instant`), detection count |
 
 ## Message Flow
 

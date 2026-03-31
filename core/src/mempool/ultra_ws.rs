@@ -218,8 +218,9 @@ impl MempoolMonitor {
         receive_ns: u64,
     ) {
         for hash in hashes {
-            // For now, send hash with timing info
-            // Full tx fetch will be done by detector
+            // Dispatch hash with timing metadata. The detector pipeline fetches
+            // full tx data via eth_getTransactionByHash in its own batch loop,
+            // keeping this ingest path allocation-free and latency-bounded.
             let mempool_tx = MempoolTx {
                 hash: *hash,
                 tx: Transaction::default(),
@@ -354,21 +355,101 @@ impl EnhancedMempoolMonitor {
         )
     }
     
-    /// Fast swap parsing
+    /// Fast swap parsing — decodes token addresses and amounts from ABI-encoded calldata.
+    /// Supports V2 (swapExactTokensForTokens, swapExactETHForTokens, swapExactTokensForETH)
+    /// and V3 (exactInputSingle). Returns None for unsupported selectors.
     fn parse_swap_fast(&self, tx: &Transaction) -> Option<SwapInfo> {
-        if tx.input.len() < 68 {
+        let data = &tx.input;
+        if data.len() < 68 {
             return None;
         }
-        
-        // Simplified parsing - real implementation uses FFI
-        Some(SwapInfo {
-            token_in: Address::zero(),
-            token_out: Address::zero(),
-            amount_in: U256::zero(),
-            min_amount_out: U256::zero(),
-            dex_type: DexType::UniswapV2,
-            pool_address: Address::zero(),
-        })
+
+        let selector: [u8; 4] = data[0..4].try_into().ok()?;
+
+        match selector {
+            // ── V2: swapExactTokensForTokens(uint256,uint256,address[],address,uint256) ──
+            [0x38, 0xed, 0x17, 0x39] => {
+                if data.len() < 4 + 5 * 32 {
+                    return None;
+                }
+                let amount_in   = U256::from_big_endian(&data[4..36]);
+                let min_out     = U256::from_big_endian(&data[36..68]);
+                // path offset at word 2, path length at that offset, first two addresses
+                let path_offset = U256::from_big_endian(&data[68..100]).as_usize() + 4;
+                if data.len() < path_offset + 32 {
+                    return None;
+                }
+                let path_len = U256::from_big_endian(&data[path_offset..path_offset + 32]).as_usize();
+                if path_len < 2 || data.len() < path_offset + 32 + path_len * 32 {
+                    return None;
+                }
+                let token_in  = Address::from_slice(&data[path_offset + 32 + 12..path_offset + 32 + 32]);
+                let token_out = Address::from_slice(&data[path_offset + 64 + 12..path_offset + 64 + 32]);
+                Some(SwapInfo {
+                    token_in, token_out, amount_in, min_amount_out: min_out,
+                    dex_type: DexType::UniswapV2, pool_address: Address::zero(),
+                })
+            }
+            // ── V2: swapExactETHForTokens(uint256,address[],address,uint256) ──
+            [0x7f, 0xf3, 0x6a, 0xb5] => {
+                if data.len() < 4 + 4 * 32 {
+                    return None;
+                }
+                let min_out     = U256::from_big_endian(&data[4..36]);
+                let path_offset = U256::from_big_endian(&data[36..68]).as_usize() + 4;
+                if data.len() < path_offset + 32 {
+                    return None;
+                }
+                let path_len = U256::from_big_endian(&data[path_offset..path_offset + 32]).as_usize();
+                if path_len < 2 || data.len() < path_offset + 32 + path_len * 32 {
+                    return None;
+                }
+                let token_in  = Address::from_slice(&data[path_offset + 32 + 12..path_offset + 32 + 32]);
+                let token_out = Address::from_slice(&data[path_offset + 64 + 12..path_offset + 64 + 32]);
+                Some(SwapInfo {
+                    token_in, token_out, amount_in: tx.value, min_amount_out: min_out,
+                    dex_type: DexType::UniswapV2, pool_address: Address::zero(),
+                })
+            }
+            // ── V2: swapExactTokensForETH(uint256,uint256,address[],address,uint256) ──
+            [0x18, 0xcb, 0xaf, 0xe5] => {
+                if data.len() < 4 + 5 * 32 {
+                    return None;
+                }
+                let amount_in   = U256::from_big_endian(&data[4..36]);
+                let min_out     = U256::from_big_endian(&data[36..68]);
+                let path_offset = U256::from_big_endian(&data[68..100]).as_usize() + 4;
+                if data.len() < path_offset + 32 {
+                    return None;
+                }
+                let path_len = U256::from_big_endian(&data[path_offset..path_offset + 32]).as_usize();
+                if path_len < 2 || data.len() < path_offset + 32 + path_len * 32 {
+                    return None;
+                }
+                let token_in  = Address::from_slice(&data[path_offset + 32 + 12..path_offset + 32 + 32]);
+                let token_out = Address::from_slice(&data[path_offset + 64 + 12..path_offset + 64 + 32]);
+                Some(SwapInfo {
+                    token_in, token_out, amount_in, min_amount_out: min_out,
+                    dex_type: DexType::UniswapV2, pool_address: Address::zero(),
+                })
+            }
+            // ── V3: exactInputSingle(ExactInputSingleParams) ──
+            // Params struct: tokenIn, tokenOut, fee, recipient, deadline, amountIn, amountOutMin, sqrtPriceLimitX96
+            [0x41, 0x4b, 0xf3, 0x89] => {
+                if data.len() < 4 + 8 * 32 {
+                    return None;
+                }
+                let token_in  = Address::from_slice(&data[4 + 12..4 + 32]);
+                let token_out = Address::from_slice(&data[36 + 12..36 + 32]);
+                let amount_in = U256::from_big_endian(&data[4 + 5 * 32..4 + 6 * 32]);
+                let min_out   = U256::from_big_endian(&data[4 + 6 * 32..4 + 7 * 32]);
+                Some(SwapInfo {
+                    token_in, token_out, amount_in, min_amount_out: min_out,
+                    dex_type: DexType::UniswapV3, pool_address: Address::zero(),
+                })
+            }
+            _ => None,
+        }
     }
     
     pub fn stop(&self) {

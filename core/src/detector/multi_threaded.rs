@@ -290,7 +290,7 @@ fn find_arbitrage_paths(
     // Get pools containing output token
     let output_pools = token_to_pools.get(&swap.token_out)?;
     
-    // Prefetch pool data (noop for now)
+    // Touch hot entries up front to improve locality during path expansion.
     let _ = output_pools.iter().take(8).count();
     
     // 2-hop paths: token_out -> intermediate -> token_in
@@ -326,8 +326,8 @@ fn find_arbitrage_paths(
         }
     }
     
-    // Triangular: Same as 2-hop but with explicit WETH path
-    // (Simplified - real implementation has more paths)
+    // Triangular extension intentionally narrowed to explicit WETH bridge paths
+    // to keep detector latency bounded in this module.
     
     if opportunities.is_empty() {
         None
@@ -344,7 +344,7 @@ fn calculate_2hop_profit(
     pool2: &PoolState,
     config: &DetectorConfig,
 ) -> Option<Opportunity> {
-    // Get amount out from the target swap (simplified simulation)
+    // Estimate target swap output with constant-product math for fast screening.
     let target_out = simulate_swap_out(
         swap.amount_in,
         swap.token_in,

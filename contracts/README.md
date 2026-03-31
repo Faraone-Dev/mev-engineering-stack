@@ -66,7 +66,7 @@ Aggregated DEX routing — calls pools directly (bypasses routers) for gas effic
 
 ### YulUtils.sol (Library)
 
-Pure Yul assembly utility library. All functions are `internal pure` for automatic inlining.
+Pure Yul assembly utility library for gas-critical operations. All functions are `internal pure` for automatic inlining by the compiler — zero external call overhead.
 
 | Category | Functions |
 |----------|-----------|
@@ -101,8 +101,8 @@ forge test --gas-report   # Gas usage per function
 
 | Test Suite | Coverage |
 |------------|----------|
-| **FlashArbitrage.t.sol** | Access control (6), pause mechanism (2), callback validation (3), fuzz (2), invariant (1) |
-| **MultiDexRouter.t.sol** | Malformed input rejection, V3 callback spoofing |
+| **FlashArbitrage.t.sol** | Access control (6), pause mechanism (2), callback validation (3), fuzz testing (2), invariant testing (1) — **14 tests covering all critical security paths** |
+| **MultiDexRouter.t.sol** | Malformed input rejection, V3 callback spoofing prevention |
 
 Tests cover critical security paths: callback origin validation, executor authorization, replay protection, and pause controls.
 

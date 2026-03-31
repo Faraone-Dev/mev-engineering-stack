@@ -88,7 +88,7 @@ impl ArbitrageDetector {
         // Resolve pool addresses from cache for each hop in the path
         let entry_dex = swap.dex.clone();
         let path = vec![entry_dex, exit_dex];
-        let pool_addresses = self.resolve_pool_addresses(&swap.token_in, &swap.token_out, &path);
+        let pool_addresses = self.resolve_pool_addresses(&swap.token_in, &swap.token_out, &path)?;
         let pool_fees = path.iter().map(|d| match d {
             DexType::UniswapV3 => 500,
             _ => 3000,
@@ -414,8 +414,8 @@ impl ArbitrageDetector {
     }
 
     /// Resolve actual pool contract addresses from the cache for each path hop.
-    /// Returns one address per hop. If a pool isn't found, uses [0u8; 20] placeholder.
-    fn resolve_pool_addresses(&self, token_in: &str, token_out: &str, path: &[DexType]) -> Vec<[u8; 20]> {
+    /// Returns None if any pool cannot be resolved — caller must skip the opportunity.
+    fn resolve_pool_addresses(&self, token_in: &str, token_out: &str, path: &[DexType]) -> Option<Vec<[u8; 20]>> {
         let cache = self.pool_cache.read();
         let token_in_bytes = decode_addr(token_in);
         let token_out_bytes = decode_addr(token_out);
@@ -429,18 +429,20 @@ impl ArbitrageDetector {
             };
 
             // Search cache for a pool matching this token pair and DEX type
-            for (key, pool) in cache.iter() {
+            let mut found = None;
+            for (_key, pool) in cache.iter() {
                 let pool_matches = (pool.token0 == search_t0 && pool.token1 == search_t1)
                     || (pool.token0 == search_t1 && pool.token1 == search_t0);
                 if pool_matches {
                     let pool_dex = dex_from_fee(pool.fee);
                     if std::mem::discriminant(&pool_dex) == std::mem::discriminant(dex) {
-                        return pool.address;
+                        found = Some(pool.address);
+                        break;
                     }
                 }
             }
-            [0u8; 20] // fallback — pool not yet cached
-        }).collect()
+            found // None if pool not cached → collect() yields None, skipping this opportunity
+        }).collect::<Option<Vec<_>>>()
     }
 }
 
@@ -708,6 +710,9 @@ mod tests {
             reserve0: 1000,
             reserve1: 2000,
             fee: 3000,
+            sqrt_price_x96: 0,
+            liquidity: 0,
+            is_v3: false,
         };
         let swap = SwapInfo {
             dex: DexType::UniswapV2,
@@ -731,6 +736,9 @@ mod tests {
             reserve0: 1000,
             reserve1: 2000,
             fee: 3000,
+            sqrt_price_x96: 0,
+            liquidity: 0,
+            is_v3: false,
         };
         let swap = SwapInfo {
             dex: DexType::UniswapV2,
@@ -754,6 +762,9 @@ mod tests {
             reserve0: 1000,
             reserve1: 2000,
             fee: 3000,
+            sqrt_price_x96: 0,
+            liquidity: 0,
+            is_v3: false,
         };
         let swap = SwapInfo {
             dex: DexType::UniswapV2,

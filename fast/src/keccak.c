@@ -107,10 +107,12 @@ int mev_keccak256(const uint8_t *input, size_t input_len, uint8_t *output) {
     size_t rate = 136;
     size_t i, offset = 0;
 
-    /* Absorb phase */
+    /* Absorb phase — use memcpy to avoid UB on unaligned input */
     while (input_len >= rate) {
         for (i = 0; i < rate / 8; i++) {
-            state[i] ^= ((uint64_t*)input)[i];
+            uint64_t lane;
+            memcpy(&lane, input + i * 8, 8);
+            state[i] ^= lane;
         }
         keccak_f(state);
         input += rate;
@@ -124,7 +126,9 @@ int mev_keccak256(const uint8_t *input, size_t input_len, uint8_t *output) {
     temp[rate - 1] |= 0x80;
 
     for (i = 0; i < rate / 8; i++) {
-        state[i] ^= ((uint64_t*)temp)[i];
+        uint64_t lane;
+        memcpy(&lane, temp + i * 8, 8);
+        state[i] ^= lane;
     }
     keccak_f(state);
 

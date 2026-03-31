@@ -44,21 +44,21 @@ go test -bench . ./...    # selector dispatch + gas oracle benchmarks
 
 | Package | Description |
 |---------|-------------|
-| **mempool** | WebSocket pending-tx subscription via `gethclient`. Configurable selector filtering, 10k tx buffer, backpressure handling. |
+| **mempool** | WebSocket pending-tx subscription via `gethclient`. Configurable selector filtering, 10k tx buffer, backpressure handling. **Classified txs forwarded to Rust core via gRPC** with 100ms timeout and graceful fallback to monitor-only mode. |
 | **pipeline** | Multi-worker transaction classifier. Dispatches on function selector: UniswapV2 (6 selectors), V3 (4), ERC20 transfers, Aave V2/V3 liquidations, flash loans. Zero-allocation hot path at **40.7 ns/op**. |
-| **block** | New-head subscription with configurable reorg detection depth. Automatic polling fallback if WebSocket drops. |
-| **gas** | EIP-1559 base fee oracle. Real formula: `baseFee * (1 + elasticity * gasUsedDelta / gasTarget)`. Multi-block prediction for bundle gas pricing at **425 ns/op**. |
-| **relay** | Flashbots relay client with EIP-191 bundle signing (`eth_sendBundle`, `eth_callBundle`, `flashbots_getBundleStats`). Automatic retry with exponential backoff. |
-| **relay (multi)** | Multi-relay manager — 3 strategies: `Race` (first response wins), `Primary` (fallback chain), `All` (broadcast to all relays). Concurrent submission with context cancellation. |
+| **block** | New-head subscription with configurable reorg detection depth. Automatic polling fallback if WebSocket drops. **`BlockTxChan()` provides block-based tx feed** — critical for L2 chains (Arbitrum) without public mempool. Semaphore-limited concurrent block fetches (max 4). |
+| **gas** | EIP-1559 base fee oracle. Real formula: `baseFee * (1 + elasticity * gasUsedDelta / gasTarget)`. Ring buffer history with moving average. Multi-block prediction for bundle gas pricing at **425 ns/op**. |
+| **relay** | Flashbots relay client with EIP-191 bundle signing (`eth_sendBundle`, `eth_callBundle` dry-run simulation, `flashbots_getBundleStats` tracking). Automatic retry with exponential backoff. |
+| **relay (multi)** | Multi-relay manager — 3 strategies: `Race` (first response wins, cancel others), `Primary` (failover chain), `All` (broadcast to all relays). Concurrent goroutine submission with context cancellation. Atomic success/failure counters for monitoring. |
 | **rpc** | Connection pool with health checking, latency-based routing, automatic reconnection. Supports multiple RPC endpoints with weighted selection. |
-| **metrics** | Prometheus instrumentation for RPC latency, mempool throughput, pipeline classification breakdown, relay submission stats. Bind address configurable. |
+| **metrics** | **20+ Prometheus metrics** for RPC latency (histograms with bucket distribution), mempool throughput, pipeline classification breakdown, relay submission stats (success/fail/latency), gas oracle predictions, node connection health. Bind address configurable. |
 | **strategy** | gRPC client to Rust core. 100ms timeout, keepalive, graceful fallback to monitor-only mode when core is offline. |
 
 ### `pkg/`
 
 | Package | Description |
 |---------|-------------|
-| **config** | Environment-based configuration with typed parsing. Reads from `.env` with sensible defaults. |
+| **config** | Environment-based configuration with typed parsing. Reads from `.env` with sensible defaults. Validates `EXECUTE_MODE` (`simulate`/`live`) and enforces required signing keys in live mode. |
 | **types** | Shared types: `OpportunityType`, `TxClass`, cross-package data structures. |
 
 ### `cmd/`
@@ -66,7 +66,7 @@ go test -bench . ./...    # selector dispatch + gas oracle benchmarks
 | Command | Description |
 |---------|-------------|
 | **mev-node** | Main binary. Orchestrates mempool → pipeline → strategy → relay loop. Prometheus server on `:9090`. |
-| **testnet-verify** | Testnet signing verification. Generates ECDSA key, signs EIP-1559 tx on Arbitrum Sepolia (421614), constructs Flashbots bundle with EIP-191, verifies via ecrecover. `--submit` flag for live submission. |
+| **testnet-verify** | Testnet signing verification. Generates ECDSA key, signs EIP-1559 tx on Arbitrum Sepolia (421614), constructs Flashbots bundle with EIP-191 signature, verifies via `ecrecover`. `--submit` flag for live submission to relay. End-to-end proof that the signing pipeline works. |
 
 ## Benchmarks
 

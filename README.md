@@ -56,8 +56,8 @@ Sub-microsecond mempool monitoring, transaction classification, bundle construct
 | Layer | Language | Purpose | Entry Point |
 |-------|----------|---------|-------------|
 | **network/** | Go 1.21 | Mempool monitoring, tx classification, Flashbots relay, Prometheus metrics | `cmd/mev-node/main.go` |
-| **core/** | Rust 2021 | MEV detection, revm simulation, bundle construction, gRPC server | `src/main.rs` |
-| **fast/** | C (GCC/Clang) | SIMD keccak, RLP encoding, lock-free MPSC queue, arena allocator | `src/keccak.c` |
+| **core/** | Rust 2021 | MEV detection (arbitrage + backrun + liquidation), AMM simulation (V2 constant-product + V3 concentrated liquidity), bundle construction, gRPC server | `src/main.rs` |
+| **fast/** | C (GCC/Clang) | SIMD keccak (`memcpy`-safe absorb), RLP encoding, lock-free MPSC queue (CAS slot-claim), arena allocator (batch + rollback) | `src/keccak.c` |
 | **contracts/** | Solidity | Flash loan arbitrage (Balancer V2), multi-DEX routing | `src/FlashArbitrage.sol` |
 | **proto/** | Protocol Buffers | Cross-language service contract (Go ↔ Rust) | `mev.proto` |
 
@@ -135,13 +135,13 @@ Production-grade mempool monitoring used as the entry point for the MEV pipeline
 
 | Package | Role |
 |---------|------|
-| `internal/mempool` | WebSocket pending-tx subscription (`gethclient`), selector filtering |
-| `internal/pipeline` | Multi-worker classifier — UniswapV2 (6 selectors), V3 (4), ERC20, Aave, flash loans |
-| `internal/block` | New-head subscription with reorg detection, polling fallback |
+| `internal/mempool` | WebSocket pending-tx subscription (`gethclient`), selector filtering, **gRPC forwarding to Rust core** with 100ms timeout and graceful fallback |
+| `internal/pipeline` | Multi-worker classifier — UniswapV2 (6 selectors), V3 (4), ERC20, Aave, flash loans. **Zero-allocation hot path at 40.7 ns/op** |
+| `internal/block` | New-head subscription with reorg detection, polling fallback. **`BlockTxChan()` for block-based tx feed on L2 without public mempool** |
 | `internal/gas` | EIP-1559 base fee oracle with multi-block prediction |
-| `internal/relay` | Flashbots `eth_sendBundle` + multi-relay manager (Race / Primary / All) |
-| `internal/rpc` | Connection pool, health checks, latency-based routing |
-| `internal/metrics` | Prometheus instrumentation (RPC latency, mempool throughput, relay stats) |
+| `internal/relay` | Flashbots `eth_sendBundle` + multi-relay manager (Race / Primary / All). **EIP-191 bundle signing, `eth_callBundle` dry-run, `flashbots_getBundleStats`** |
+| `internal/rpc` | Connection pool, health checks, latency-based routing, automatic reconnection |
+| `internal/metrics` | **20+ Prometheus metrics**: RPC latency histograms, mempool buffer usage, pipeline classification breakdown, relay submission success/failure, gas oracle tracking, node health |
 | `cmd/mev-node` | Main binary — pipeline orchestration |
 | `cmd/testnet-verify` | Testnet signing verification (EIP-1559 tx + EIP-191 bundle proof) |
 
@@ -175,10 +175,16 @@ cargo bench               # 7 Criterion benchmark groups
 ### Detection Pipeline
 
 ```
-PendingTx → parse_swap() → ArbitrageDetector ──┐
-            (8 selectors)   BackrunDetector  ────┼─▶ EvmSimulator ──▶ BundleBuilder ──▶ Bundle
-                            LiquidationDetector─┘    (revm 8.0)       (ABI encode)
+PendingTx → parse_swap() → ArbitrageDetector  ──┐
+            (8 selectors,   BackrunDetector   ────┼─▶ EvmSimulator ──▶ BundleBuilder ──▶ Bundle
+             checked math)  LiquidationDetector─┘    (V2 + V3 AMM)     (ABI encode)
 ```
+
+- **ArbitrageDetector**: Cross-DEX price discrepancy with cached pool state, checked arithmetic
+- **BackrunDetector**: Price recovery capture after large swaps with impact threshold
+- **LiquidationDetector**: Aave V3, Compound V3, Morpho position tracking with close factor limits
+- **MultiThreaded**: Parallel worker pool via crossbeam channels
+- **EvmSimulator**: V2 constant-product (35 ns) + V3 concentrated liquidity via `sqrtPriceX96` → virtual reserves conversion, auto-routing by pool type
 
 ### gRPC Bridge (Go ↔ Rust)
 
@@ -188,7 +194,7 @@ PendingTx → parse_swap() → ArbitrageDetector ──┐
 | Rust server | `core/src/grpc/server.rs` | tonic 0.11 |
 | Go client | `network/internal/strategy/client.go` | google.golang.org/grpc 1.60 |
 
-RPCs: `DetectOpportunity`, `StreamOpportunities`, `GetStatus`
+RPCs: `DetectOpportunity` (unary detect+simulate+build), `StreamOpportunities` (server-streaming via `tokio::broadcast` with profit threshold filter), `GetStatus` (health + uptime + counters)
 
 Target: **< 10ms** round-trip for detect + simulate + bundle on co-located infra.
 
@@ -196,7 +202,7 @@ Target: **< 10ms** round-trip for detect + simulate + bundle on co-located infra
 
 ## Smart Contracts — `contracts/`
 
-Foundry-based Solidity with hardened callback validation.
+Foundry-based Solidity with hardened callback validation. 5-field execution context prevents callback forgery (executor, token, amount, swapHash, nonce). Factory-verified pool addresses.
 
 | Contract | Purpose | Security |
 |----------|---------|----------|
@@ -215,14 +221,14 @@ forge test -vvv
 
 SIMD-accelerated primitives linked into Rust via FFI (`core/src/ffi/`).
 
-| File | Function | Optimization |
-|------|----------|-------------|
-| `keccak.c` | Keccak-256 (24-round permutation) | Batch hashing |
-| `rlp.c` | RLP encoding (tx serialization) | Zero-copy output |
-| `simd_utils.c` | Byte comparison, address matching | AVX2 + SSE4.2 |
-| `lockfree_queue.c` | MPSC queue (detector→simulator) | CAS-only, no mutex |
-| `memory_pool.c` | Arena allocator | Zero-alloc per tx |
-| `parser.c` | Binary calldata parsing | Unrolled loops |
+| File | Function | Optimization | Safety |
+|------|----------|-------------|--------|
+| `keccak.c` | Keccak-256 (24-round permutation, Ethereum `0x01` padding) | Batch hashing | `memcpy` absorb — no alignment UB |
+| `rlp.c` | RLP encoding (tx serialization) | Zero-copy output | Bounds-checked length prefixes |
+| `simd_utils.c` | Byte comparison, address matching, batch price impact (`__uint128_t`) | AVX2 + SSE4.2, `_mm_prefetch` binary search, non-temporal stores | Mixed-case hex decode (A-F + a-f) |
+| `lockfree_queue.c` | MPSC queue (detector→simulator) | CAS-only, no mutex | `alignas(64)` head/tail — no false sharing, CAS slot-claim before write |
+| `memory_pool.c` | Arena allocator (3 specialized pools) | Zero-alloc per tx, batch alloc | Atomic rollback on partial batch failure |
+| `parser.c` | Binary calldata parsing (V2/V3 ABI) | Unrolled loops | Length validation before decode |
 
 Compile flags: `-O3 -march=native -mavx2 -msse4.2 -flto -falign-functions=64`
 
@@ -277,7 +283,10 @@ cd core && cargo bench
 | `MEV_RPC_ENDPOINTS` | Comma-separated WebSocket RPC URLs | — |
 | `ARBITRUM_RPC_URL` | Arbitrum HTTP endpoint | — |
 | `ARBITRUM_WS_URL` | Arbitrum WebSocket endpoint | — |
+| `EXECUTE_MODE` | Bundle execution mode (`simulate` or `live`) | `simulate` |
+| `PRIVATE_KEY` | EOA key used to sign EIP-1559 executor transactions | — |
 | `FLASHBOTS_SIGNING_KEY` | ECDSA key for bundle signing (EIP-191) | — |
+| `MEV_USE_FFI` | Enable C fast-path wrappers (`1`/`true`) when available | `false` |
 | `MEV_PIPELINE_WORKERS` | Parallel classification workers | `4` |
 | `MEV_METRICS_ADDR` | Prometheus metrics bind address | `:9090` |
 
@@ -403,10 +412,10 @@ mev-engineering-stack/
 ├── core/                   # Rust — detection, simulation, bundle construction
 │   ├── src/
 │   │   ├── detector/       # ArbitrageDetector, BackrunDetector, LiquidationDetector
-│   │   ├── simulator/      # EvmSimulator (revm 8.0, constant-product)
+│   │   ├── simulator/      # EvmSimulator — V2 constant-product (35 ns) + V3 concentrated liquidity (sqrtPriceX96), auto-routing
 │   │   ├── builder/        # BundleBuilder (ABI encoding, gas pricing)
-│   │   ├── grpc/           # tonic server (MevEngine service)
-│   │   ├── arbitrum/       # Arbitrum-specific detection + execution
+│   │   ├── grpc/           # tonic server — DetectOpportunity, StreamOpportunities (broadcast channel + profit filter), GetStatus
+│   │   ├── arbitrum/       # Arbitrum L2 engine: 3-DEX pool discovery (V3/Sushi/Camelot), triangular arb detection, binary search optimal amount, Balancer V2 flash executor
 │   │   ├── ffi/            # C FFI bindings (keccak, RLP, SIMD, queue)
 │   │   └── mempool/        # WebSocket data handling
 │   └── benches/            # Criterion benchmarks (7 groups)
@@ -439,24 +448,27 @@ Proprietary. See [LICENSE](LICENSE) for details.
 
 ---
 
-## ⚠️ Disclaimer — Simulation Mode
+## ⚠️ Execution Modes & Risk Posture
 
-This stack runs in **simulation mode**: it scans Arbitrum mainnet in real-time, classifies transactions, and detects MEV opportunities — but **does not submit bundles or execute trades**.
+This stack supports both read-only simulation and signed relay submission:
 
-### What's Live Now
-- ✅ Real-time block scanning on Arbitrum One (mainnet)
-- ✅ Transaction classification at 40.7 ns/op (24.5M tx/sec theoretical)
-- ✅ Opportunity detection (arbitrage, backrun, liquidation)
-- ✅ EIP-1559 gas oracle with prediction
-- ✅ Multi-RPC pool with health checks and failover
-- ✅ Prometheus metrics + live dashboard
+- `simulate` (default): detect, simulate, build, and dry-run without sending signed bundles.
+- `live`: signs EIP-1559 executor transactions and submits bundles to configured relays.
 
-### What's Needed for Live Execution
-- 🔲 **Security audit** — formal verification of flash loan callback logic
-- 🔲 **Flashbots relay integration** — `eth_sendBundle` to block builders (Flashbots Protect, MEV Blocker, Merkle)
-- 🔲 **Contract deployment** — `FlashArbitrage.sol` + `MultiDexRouter.sol` on Arbitrum One
-- 🔲 **Co-located infrastructure** — bare-metal node with sub-ms latency to the Arbitrum sequencer
-- 🔲 **Capital** — ETH for gas + working capital for profitable flash arbitrage
-- 🔲 **Monitoring & alerting** — failed bundle detection, gas spike alerts, profit degradation tracking
+### Live Mode Requirements
 
-> The architecture is designed for production MEV extraction. The simulation layer proves the pipeline end-to-end on real mainnet data before committing capital.
+- `EXECUTE_MODE=live`
+- `PRIVATE_KEY` present (executor transaction signer)
+- `FLASHBOTS_SIGNING_KEY` present (bundle auth signer)
+- Deployed and configured contracts (`FlashArbitrage`, `MultiDexRouter`) on target chain
+
+The launcher and node configuration fail fast if required live credentials are missing.
+
+### Current Readiness
+
+- ✅ End-to-end pipeline: ingest → classify → detect → simulate → build → relay handling
+- ✅ Preflight relay simulation (`eth_callBundle`) before live submission
+- ✅ Real-time metrics and dashboard for operational visibility
+- ⚠️ Not audited for real funds; run with testnet/simulation defaults unless you accept production risk
+
+> Recommended workflow: validate strategy changes in `simulate`, then promote selectively to `live` with audited contracts and strict key management.

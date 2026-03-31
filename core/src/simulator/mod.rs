@@ -86,6 +86,50 @@ impl EvmSimulator {
         (DEFAULT_WETH_RESERVE, DEFAULT_USDC_RESERVE, DEFAULT_FEE_BPS)
     }
 
+    /// Look up full pool state including V3 fields.
+    fn pool_state_full(&self, pool_addr: &[u8; 20]) -> (u128, u128, u128, u128, u128, bool) {
+        if *pool_addr != [0u8; 20] {
+            if let Some(pool) = self.pool_cache.read().get(pool_addr) {
+                return (
+                    pool.reserve0,
+                    pool.reserve1,
+                    pool.fee as u128,
+                    pool.sqrt_price_x96,
+                    pool.liquidity,
+                    pool.is_v3,
+                );
+            }
+        }
+        (DEFAULT_WETH_RESERVE, DEFAULT_USDC_RESERVE, DEFAULT_FEE_BPS, 0, 0, false)
+    }
+
+    /// Execute a swap against a pool, automatically choosing V2 or V3 math.
+    fn swap_through_pool(
+        &self,
+        amount_in: u128,
+        pool_addr: &[u8; 20],
+        fee_override: Option<u128>,
+        zero_for_one: bool,
+    ) -> u128 {
+        let (r0, r1, default_fee, sqrt_price, liquidity, is_v3) = self.pool_state_full(pool_addr);
+        let fee = fee_override.unwrap_or(default_fee);
+
+        if is_v3 && sqrt_price > 0 && liquidity > 0 {
+            concentrated_liquidity_swap(
+                amount_in,
+                sqrt_price,
+                liquidity,
+                if zero_for_one { r0 } else { r1 },
+                if zero_for_one { r1 } else { r0 },
+                fee,
+                zero_for_one,
+            )
+        } else {
+            let (ri, ro) = if zero_for_one { (r0, r1) } else { (r1, r0) };
+            constant_product_swap(amount_in, ri, ro, fee)
+        }
+    }
+
     pub async fn start(&self) -> anyhow::Result<()> {
         info!("EVM Simulator started (revm fork mode)");
         Ok(())
@@ -208,28 +252,16 @@ impl EvmSimulator {
         // Step 1: Flash loan amount_in of token_in
         let flash_amount = opp.amount_in;
 
-        // Step 2: Look up entry pool reserves from cache
+        // Step 2: Swap through entry pool (buy mid-token)
         let entry_addr = opp.pool_addresses.first().copied().unwrap_or([0u8; 20]);
-        let (entry_r0, entry_r1, entry_default_fee) = self.pool_reserves(&entry_addr);
+        let entry_fee = opp.pool_fees.first().map(|&f| (f / 100) as u128);
+        let amount_mid = self.swap_through_pool(flash_amount, &entry_addr, entry_fee, true);
 
-        let entry_fee = if let Some(&fee) = opp.pool_fees.first() {
-            (fee / 100) as u128  // pool_fees stores raw bps * 100 (e.g. 3000 = 30 bps)
-        } else {
-            entry_default_fee
-        };
-        let amount_mid = constant_product_swap(flash_amount, entry_r0, entry_r1, entry_fee);
-
-        // Step 3: Look up exit pool reserves from cache
+        // Step 3: Swap through exit pool (sell mid-token for original token)
         let exit_addr = opp.pool_addresses.get(1).copied().unwrap_or([0u8; 20]);
-        let (exit_r0, exit_r1, exit_default_fee) = self.pool_reserves(&exit_addr);
-
-        let exit_fee = if let Some(&fee) = opp.pool_fees.get(1) {
-            (fee / 100) as u128
-        } else {
-            exit_default_fee
-        };
-        // Swap back: mid-token → original token (reverse reserves)
-        let amount_out = constant_product_swap(amount_mid, exit_r1, exit_r0, exit_fee);
+        let exit_fee = opp.pool_fees.get(1).map(|&f| (f / 100) as u128);
+        // Exit pool is reversed: we're selling mid-token (token0) for original (token1)
+        let amount_out = self.swap_through_pool(amount_mid, &exit_addr, exit_fee, false);
 
         // Step 4: Calculate profit
         let gross: i128 = amount_out as i128 - flash_amount as i128;
@@ -245,6 +277,8 @@ impl EvmSimulator {
         let net_profit = gross - gas_cost - flash_fee;
 
         // State changes: record the two pool reserve updates
+        let (entry_r0, _, _) = self.pool_reserves(&entry_addr);
+        let (_, exit_r1, _) = self.pool_reserves(&exit_addr);
         let state_changes = vec![
             StateChange {
                 address: entry_addr,
@@ -394,6 +428,114 @@ pub fn constant_product_swap(
     if denominator == 0 { 0 } else { numerator / denominator }
 }
 
+/// Uniswap V3 concentrated liquidity swap simulation.
+///
+/// Models a single-tick-range swap using the V3 `sqrtPriceX96` math.
+/// Given virtual reserves derived from `sqrtPriceX96` and `liquidity`,
+/// computes the output amount respecting concentrated liquidity bounds.
+///
+/// This is an approximation that works well when the swap stays within
+/// one active tick range (which is the common case for MEV-sized trades).
+///
+/// ## Parameters
+/// - `amount_in`: input amount in token's smallest unit
+/// - `sqrt_price_x96`: current pool sqrt price as Q64.96 fixed-point
+///   (if 0, falls back to constant-product using reserves)
+/// - `liquidity`: active in-range liquidity (L)
+/// - `reserve_in` / `reserve_out`: pool reserves (used as fallback)
+/// - `fee_bps`: fee in basis points (e.g. 5 = 0.05%, 30 = 0.30%)
+/// - `zero_for_one`: true if swapping token0 → token1
+#[inline]
+pub fn concentrated_liquidity_swap(
+    amount_in: u128,
+    sqrt_price_x96: u128,
+    liquidity: u128,
+    reserve_in: u128,
+    reserve_out: u128,
+    fee_bps: u128,
+    zero_for_one: bool,
+) -> u128 {
+    if amount_in == 0 || fee_bps >= 10_000 {
+        return 0;
+    }
+
+    // If sqrtPriceX96 or liquidity not available, fall back to constant product
+    if sqrt_price_x96 == 0 || liquidity == 0 {
+        return constant_product_swap(amount_in, reserve_in, reserve_out, fee_bps);
+    }
+
+    // Apply fee to input
+    let amount_in_after_fee = match amount_in.checked_mul(10_000 - fee_bps) {
+        Some(v) => v / 10_000,
+        None => return 0,
+    };
+
+    // Q96 = 2^96
+    const Q96: u128 = 1u128 << 96;
+
+    if zero_for_one {
+        // Swapping token0 → token1
+        // new_sqrt_price = L * sqrt_price / (L + amount_in * sqrt_price)
+        // amount_out = L * (sqrt_price_old - sqrt_price_new)
+        //
+        // Single active-range approximation: treats liquidity as constant over the swap.
+        // This is accurate for in-range MEV-sized trades that do not cross ticks.
+        // amount_out = L * √P_old - L * √P_new
+        //            = L * √P_old * amount_in * √P_old / (L + amount_in * √P_old)
+        //        (this is the exact V3 formula reduced to single-range)
+
+        // numerator = L * sqrt_price * amount_in_after_fee * sqrt_price
+        //           = amount_in_after_fee * liquidity * sqrt_price^2 / (L * Q96 + amount_in_after_fee * sqrt_price)
+        // Use u128 step-by-step to avoid overflow:
+
+        // Virtual reserve computation:
+        //   virtual_x = L * Q96 / sqrt_price
+        //   virtual_y = L * sqrt_price / Q96
+        let virtual_x = match liquidity.checked_mul(Q96) {
+            Some(v) => v / sqrt_price_x96,
+            None => return constant_product_swap(amount_in, reserve_in, reserve_out, fee_bps),
+        };
+        let virtual_y = match liquidity.checked_mul(sqrt_price_x96) {
+            Some(v) => v / Q96,
+            None => return constant_product_swap(amount_in, reserve_in, reserve_out, fee_bps),
+        };
+
+        // Use constant product on virtual reserves
+        constant_product_swap_no_fee(amount_in_after_fee, virtual_x, virtual_y)
+    } else {
+        // Swapping token1 → token0
+        // Virtual reserves flipped
+        let virtual_x = match liquidity.checked_mul(Q96) {
+            Some(v) => v / sqrt_price_x96,
+            None => return constant_product_swap(amount_in, reserve_in, reserve_out, fee_bps),
+        };
+        let virtual_y = match liquidity.checked_mul(sqrt_price_x96) {
+            Some(v) => v / Q96,
+            None => return constant_product_swap(amount_in, reserve_in, reserve_out, fee_bps),
+        };
+
+        // token1 → token0: virtual_y is reserve_in, virtual_x is reserve_out
+        constant_product_swap_no_fee(amount_in_after_fee, virtual_y, virtual_x)
+    }
+}
+
+/// Constant product swap with fee already applied (internal helper).
+#[inline]
+fn constant_product_swap_no_fee(amount_in: u128, reserve_in: u128, reserve_out: u128) -> u128 {
+    if reserve_in == 0 || reserve_out == 0 || amount_in == 0 {
+        return 0;
+    }
+    let numerator = match amount_in.checked_mul(reserve_out) {
+        Some(v) => v,
+        None => return 0,
+    };
+    let denominator = match reserve_in.checked_add(amount_in) {
+        Some(v) => v,
+        None => return 0,
+    };
+    if denominator == 0 { 0 } else { numerator / denominator }
+}
+
 /// Estimate gas for a bundle transaction based on data length
 fn estimate_tx_gas(gas_limit: u64, data: &[u8]) -> u64 {
     // Base: 21000 + 16 per non-zero byte + 4 per zero byte
@@ -516,6 +658,9 @@ mod tests {
             reserve0: 5_000_000_000_000_000_000_000,
             reserve1: 10_000_000_000_000,
             fee: 3000,
+            sqrt_price_x96: 0,
+            liquidity: 0,
+            is_v3: false,
         };
         sim.load_pools(vec![pool.clone()]);
 
@@ -538,6 +683,9 @@ mod tests {
             reserve0: 1000,
             reserve1: 2000,
             fee: 500,
+            sqrt_price_x96: 0,
+            liquidity: 0,
+            is_v3: false,
         });
         assert!(sim.get_pool(&[0xBB; 20]).is_some());
     }
@@ -552,6 +700,9 @@ mod tests {
             reserve0: 1000,
             reserve1: 2000,
             fee: 500,
+            sqrt_price_x96: 0,
+            liquidity: 0,
+            is_v3: false,
         });
         sim.update_pool(PoolState {
             address: [0xCC; 20],
@@ -560,6 +711,9 @@ mod tests {
             reserve0: 9999,
             reserve1: 8888,
             fee: 500,
+            sqrt_price_x96: 0,
+            liquidity: 0,
+            is_v3: false,
         });
         let p = sim.get_pool(&[0xCC; 20]).unwrap();
         assert_eq!(p.reserve0, 9999);
@@ -576,6 +730,9 @@ mod tests {
             reserve0: 42,
             reserve1: 84,
             fee: 300,
+            sqrt_price_x96: 0,
+            liquidity: 0,
+            is_v3: false,
         });
         let (r0, r1, fee) = sim.pool_reserves(&[0xDD; 20]);
         assert_eq!(r0, 42);
@@ -619,6 +776,50 @@ mod tests {
     fn test_constant_product_fee_100_percent() {
         let out = constant_product_swap(1_000_000, 5_000_000, 10_000_000, 10_000);
         assert_eq!(out, 0, "100% fee should yield zero output");
+    }
+
+    #[test]
+    fn test_concentrated_liquidity_swap_basic() {
+        // Simulate a V3 pool: WETH/USDC at ~2000 USDC/ETH
+        // sqrtPriceX96 for price 2000 (token1/token0) ≈ sqrt(2000) * 2^96
+        // sqrt(2000) ≈ 44.72
+        // 44.72 * 2^96 ≈ 3_543_191_142_285_914_205_922_034_688
+        let sqrt_price_x96: u128 = 3_543_191_142_285_914_205_922_034_688;
+        let liquidity: u128 = 10_000_000_000_000_000_000; // 10e18
+
+        let out = concentrated_liquidity_swap(
+            1_000_000_000_000_000_000,  // 1 ETH
+            sqrt_price_x96,
+            liquidity,
+            5_000_000_000_000_000_000_000, // fallback reserve
+            10_000_000_000_000,            // fallback reserve
+            30,                            // 0.30% fee
+            true,                          // token0 → token1
+        );
+        // Should produce some output
+        assert!(out > 0, "V3 swap should produce output, got 0");
+    }
+
+    #[test]
+    fn test_concentrated_liquidity_fallback_to_v2() {
+        // When sqrtPriceX96=0, should fall back to constant product
+        let out_v3 = concentrated_liquidity_swap(
+            1_000_000,
+            0, // no sqrt price → fallback
+            0, // no liquidity → fallback
+            5_000_000,
+            10_000_000,
+            30,
+            true,
+        );
+        let out_v2 = constant_product_swap(1_000_000, 5_000_000, 10_000_000, 30);
+        assert_eq!(out_v3, out_v2, "Should fall back to constant product");
+    }
+
+    #[test]
+    fn test_concentrated_liquidity_zero_input() {
+        let out = concentrated_liquidity_swap(0, 100, 100, 100, 100, 30, true);
+        assert_eq!(out, 0);
     }
 
     #[test]

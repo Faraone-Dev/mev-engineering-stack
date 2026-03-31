@@ -94,11 +94,16 @@ static void* pool_get(mev_memory_pool_t* pool) {
 
 /**
  * Return block to pool (lock-free)
+ *
+ * Write the block pointer into the slot BEFORE bumping the tail so that
+ * consumers never observe a slot with a stale/NULL pointer.  We use
+ * acquire/release ordering on tail to guarantee the store to blocks[]
+ * is visible before a consumer reads the updated tail.
  */
 static void pool_put(mev_memory_pool_t* pool, void* block) {
     if (!block) return;
     
-    unsigned int count = atomic_load(&pool->count);
+    unsigned int count = atomic_load_explicit(&pool->count, memory_order_relaxed);
     if (count >= POOL_MAX_BLOCKS) {
         // Pool full - free block
 #ifdef _WIN32
@@ -109,7 +114,19 @@ static void pool_put(mev_memory_pool_t* pool, void* block) {
         return;
     }
     
-    unsigned int tail = atomic_fetch_add(&pool->tail, 1);
+    unsigned int tail = atomic_load_explicit(&pool->tail, memory_order_relaxed);
+    unsigned int new_tail;
+    do {
+        new_tail = tail + 1;
+        /* Try to claim the slot at `tail`. If another thread raced us,
+           the CAS fails and we retry with the updated tail value. */
+    } while (!atomic_compare_exchange_weak_explicit(
+        &pool->tail, &tail, new_tail,
+        memory_order_acq_rel, memory_order_relaxed));
+    
+    /* Now we own the slot — write the block pointer. The release in the
+       CAS above ensures this store is ordered before any subsequent
+       load of tail from a consumer. */
     pool->blocks[tail % POOL_MAX_BLOCKS] = block;
 }
 

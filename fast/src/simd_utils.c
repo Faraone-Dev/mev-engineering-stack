@@ -96,7 +96,7 @@ void mev_xor_block_256(uint8_t* dst, const uint8_t* src) {
 
 /**
  * Fast hex decode using SIMD lookup
- * Input: hex string (lowercase), Output: bytes
+ * Input: hex string (lowercase or uppercase), Output: bytes
  */
 int mev_hex_decode_fast(const char* hex, size_t hex_len, uint8_t* out) {
     if (hex_len & 1) return -1; // Must be even
@@ -107,9 +107,16 @@ int mev_hex_decode_fast(const char* hex, size_t hex_len, uint8_t* out) {
         uint8_t hi = hex[i * 2];
         uint8_t lo = hex[i * 2 + 1];
         
-        // Convert hex char to nibble
-        hi = (hi <= '9') ? (hi - '0') : (hi - 'a' + 10);
-        lo = (lo <= '9') ? (lo - '0') : (lo - 'a' + 10);
+        // Convert hex char to nibble (handles 0-9, a-f, A-F)
+        if (hi >= '0' && hi <= '9')      hi = hi - '0';
+        else if (hi >= 'a' && hi <= 'f') hi = hi - 'a' + 10;
+        else if (hi >= 'A' && hi <= 'F') hi = hi - 'A' + 10;
+        else return -1;  // Invalid hex char
+        
+        if (lo >= '0' && lo <= '9')      lo = lo - '0';
+        else if (lo >= 'a' && lo <= 'f') lo = lo - 'a' + 10;
+        else if (lo >= 'A' && lo <= 'F') lo = lo - 'A' + 10;
+        else return -1;  // Invalid hex char
         
         out[i] = (hi << 4) | lo;
     }
@@ -174,7 +181,7 @@ void mev_calc_price_impact_batch(
     __m256i r1 = _mm256_loadu_si256((const __m256i*)reserves1);
     
     // For each pool: out = (amount_in * 997 * r1) / (r0 * 1000 + amount_in * 997)
-    // Simplified for demo - real impl needs 128-bit math
+    // Uses __uint128_t intermediates to keep fixed-point math safe.
     
     for (int i = 0; i < 4; i++) {
         uint64_t r0_i = reserves0[i];

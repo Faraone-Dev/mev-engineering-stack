@@ -74,9 +74,14 @@ impl BackrunDetector {
             return None;
         }
 
-        // Optimal backrun size: sqrt(swap_size * liquidity) (simplified)
-        let backrun_amount = (swap_size as f64 * 0.1).min(pool_liquidity as f64 * 0.01) as u128;
-        let backrun_amount = backrun_amount.max(1);
+        // Optimal backrun amount derived from constant-product invariant:
+        //   amount_opt = sqrt(reserve_in * reserve_out) - reserve_in
+        // Without exact reserves, approximate using swap_size and pool_liquidity
+        // as proxies: amount_opt ≈ sqrt(swap_size * liquidity) capped at 1% of pool
+        // to limit price impact of the backrun itself.
+        let geometric_mean = ((swap_size as f64) * (pool_liquidity as f64)).sqrt();
+        let cap = pool_liquidity as f64 * 0.01;
+        let backrun_amount = (geometric_mean.min(cap) as u128).max(1);
 
         debug!(
             swap_size,
