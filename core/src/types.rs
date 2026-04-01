@@ -173,7 +173,7 @@ pub struct BundleResult {
     pub error: Option<String>,
 }
 
-/// AMM pool state for constant-product simulation
+/// AMM pool state for simulation (V2 constant-product & V3 concentrated liquidity)
 #[derive(Debug, Clone)]
 pub struct PoolState {
     /// Pool contract address
@@ -194,6 +194,16 @@ pub struct PoolState {
     pub liquidity: u128,
     /// Whether this is a V3-style concentrated liquidity pool
     pub is_v3: bool,
+    /// V3: current tick index (0 for V2 pools)
+    pub current_tick: i32,
+    /// V3: tick spacing — determines granularity of initialized ticks (0 for V2 pools)
+    pub tick_spacing: i32,
+    /// V3: initialized tick data sorted by index — `(tick_index, sqrt_price_x96_at_tick, liquidity_net)`.
+    /// `sqrt_price_x96_at_tick` is the exact sqrtPriceX96 at this tick boundary.
+    /// `liquidity_net` is the signed change in active liquidity when crossing this tick
+    /// from left to right. Empty for V2 pools or when tick data is unavailable (falls
+    /// back to single-range approximation).
+    pub ticks: Vec<(i32, u128, i128)>,
 }
 
 // ─── Gas estimation ──────────────────────────────────────────────
