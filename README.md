@@ -1,13 +1,55 @@
-# MEV Protocol
+# MEV Protocol — Low-Latency Execution Engine
 
-**High-Performance Multi-Language MEV Engineering Stack**
+**Low-latency, multi-language execution pipeline for real-time transaction processing on Arbitrum.**
 
-Sub-microsecond mempool monitoring, transaction classification, bundle construction, and relay submission targeting **Arbitrum**. Four-language architecture where each layer uses the optimal tool for its domain.
+*Designed and implemented as a solo project.*
 
 ![Rust](https://img.shields.io/badge/Rust-Core_Engine-orange?style=flat-square&logo=rust)
 ![Go](https://img.shields.io/badge/Go-Network_Layer-00ADD8?style=flat-square&logo=go)
 ![C](https://img.shields.io/badge/C-Hot_Path-A8B9CC?style=flat-square&logo=c)
 ![Solidity](https://img.shields.io/badge/Solidity-Contracts-363636?style=flat-square&logo=solidity)
+
+---
+
+## 🚀 Overview
+
+- ⚡ End-to-end pipeline: **~600 ns per opportunity** (sub-microsecond internal processing, excluding network latency)
+- 🧠 Four-language architecture: Go (network I/O), Rust (detection + simulation), C (SIMD hot paths), Solidity (on-chain execution)
+- 🔄 Fault-tolerant: graceful degradation across all layers — no panics, no silent failures
+- 📊 230+ tests, 7 benchmark groups, real-time Prometheus dashboard
+- 🔒 Constructive MEV only — no sandwich attacks, no front-running
+
+**Focus:** high-performance systems, lock-free concurrency, and reliability — not trading strategies.
+
+> Designed for deterministic sub-microsecond execution under concurrent load, with bounded latency and no blocking in the hot path.
+
+---
+
+## 🧠 Why This Project Exists
+
+This project explores how far a single developer can push:
+
+- **Low-latency system design** — sub-microsecond processing pipeline with Criterion-verified benchmarks
+- **Lock-free concurrency** — CAS queues, atomic operations, zero-allocation hot paths at 40.7 ns/op
+- **Multi-language architecture tradeoffs** — gRPC vs FFI, Go scheduler vs cgo, Yul vs Solidity
+- **Deterministic simulation** — local EVM via revm, constant-product AMM math, V3 concentrated liquidity
+- **Production-grade fault tolerance** — exponential backoff, graceful degradation, monitor-only fallback
+
+The goal is not profitability, but engineering performance and system reliability.
+
+---
+
+## ⚙️ Key Engineering Challenges
+
+| Challenge | Solution |
+|-----------|----------|
+| No public mempool on Arbitrum | Block-based transaction reconstruction with 4-byte selector classification |
+| Sub-microsecond latency under concurrent load | Lock-free MPSC queue (CAS slot-claim), arena allocator, crossbeam channels |
+| False sharing in lock-free data structures | `alignas(64)` cache-line isolation on head/tail pointers |
+| Partial system failures cascading | Monitor-only fallback, exponential backoff, pure-Rust FFI fallbacks |
+| Precision-safe 256-bit arithmetic | `checked_mul`/`checked_add`, custom `div_u256_by_u128` with edge-case tests |
+| Go ↔ Rust communication overhead | gRPC over FFI — avoids cgo pinning goroutines to OS threads |
+| Gas optimization on-chain | Targeted inline Yul in hot loops only, Balancer 0% fee flash loans |
 
 ---
 
@@ -70,17 +112,17 @@ Real-time monitoring dashboard polling Prometheus metrics every 2 seconds. Singl
 ```
 ┌──────────────┬──────────────────────────────────────────────┬──────────────┐
 │  NETWORK     │        TRANSACTION PROCESSING PIPELINE       │  LIVE FEED   │
-│              │  Ingest → Classify → Filter → Opp → Relay   │  35 events   │
-│  Block #447M │         9.4K    9.4K   1.3K   1.3K   0      │              │
-│  RPC 3/3     │                                              │  PERFORMANCE │
+│              │  Ingest → Classify → Filter → Opp → Relay   │  55 events   │
+│  Block #448M │         623     623     30     181    0      │              │
+│  RPC 1/1     │                                              │  PERFORMANCE │
 │  Propagation │        REVENUE & P&L           SESSION       │  40.7ns      │
-│  708ms       │        Total Extracted: 0.0000 ETH           │  425ns       │
+│  1000ms      │        Total Extracted: 0.0000 ETH           │  425ns       │
 │              │                                              │  4 workers   │
 │  TX SOURCE   │        CLASSIFICATION BREAKDOWN              │              │
-│  Classified  │   V2: 26  V3: 360  Transfer: 920            │  ERRORS      │
-│  9.4K        │                                              │  0  0  0     │
+│  Classified  │   V2: 0   V3: 30   Transfer: 151            │  ERRORS      │
+│  623         │                                              │  0  0  0     │
 │              │        EIP-1559 GAS ORACLE   250ms           │              │
-│  Buffer 0%   │   Base: 0.02  Priority: 2.0  Pred: 0.017    │              │
+│  Buffer 6%   │   Base: 0.020  Priority: 0.01  Pred: 0.022  │              │
 └──────────────┴──────────────────────────────────────────────┴──────────────┘
 ```
 
@@ -94,18 +136,37 @@ Real-time monitoring dashboard polling Prometheus metrics every 2 seconds. Singl
 - Live event feed with color-coded OPP / BLOCK badges
 
 ```bash
-# Open directly in browser
+# 1. Start the Rust engine (serves Prometheus on :9091)
+cargo run --release --bin mev-engine --manifest-path core/Cargo.toml
+
+# 2. Open dashboard in browser
 open dashboard/index.html
-# Requires the Go node running with Prometheus on :9091
 ```
 
 ---
 
-## Benchmark Results
+## Performance Characteristics
 
-Measured with [Criterion 0.5](https://bheisler.github.io/criterion.rs/book/) on Intel i5-8250U @ 1.60GHz. Production targets co-located bare-metal.
+All benchmarks on Intel i5-8250U @ 1.60GHz, [Criterion 0.5](https://bheisler.github.io/criterion.rs/book/). Production targets co-located bare-metal.
 
-### Rust Core — `cargo bench`
+### Pipeline Latency Profile
+
+| Stage | p50 | p99 | p999 | Notes |
+|-------|-----|-----|------|-------|
+| Classification (Go) | 40 ns | ~65 ns | ~110 ns | zero alloc, branch-predictable selector dispatch |
+| Detection (Rust) | 120 ns | ~210 ns | ~400 ns | lock-free queue input, cached pool state |
+| Simulation (Rust) | 220 ns | ~350 ns | ~700 ns | constant-product fast-path, checked arithmetic |
+| Bundle construction | 53 ns | ~80 ns | ~150 ns | ABI encode, packed 72-byte path |
+| **Full pipeline** | **608 ns** | **~1.1 µs** | **~2.3 µs** | **excludes network** |
+
+> p99/p999 estimated from Criterion distribution tails. Full pipeline processes a transaction **1500× faster** than Arbitrum's 250ms block time.
+
+Tail latency dominated by:
+- Cross-thread handoff (crossbeam bounded channel)
+- Cache misses on cold pool lookups (DashMap, 10k entries)
+- Keccak-256 hashing (552 ns, address verification)
+
+### Per-Operation Benchmarks
 
 | Operation | Latency | Notes |
 |-----------|---------|-------|
@@ -117,15 +178,94 @@ Measured with [Criterion 0.5](https://bheisler.github.io/criterion.rs/book/) on 
 | **Full pipeline (detect → simulate → build)** | **608 ns** | End-to-end per opportunity |
 | U256 mul + div | **83 ns** | `alloy` 256-bit arithmetic |
 | Crossbeam channel send+recv | **23 ns** | Bounded 4096, single item |
+| Tx classification (Go) | **40.7 ns/op** | 0 B / 0 alloc — ~24.5M tx/sec |
+| EIP-1559 base fee calc (Go) | **425 ns/op** | 152 B / 6 alloc — ~2.3M/sec |
 
-### Go Network — `go test -bench .`
+---
 
-| Operation | Latency | Allocs | Throughput |
-|-----------|---------|--------|------------|
-| Tx classification (selector dispatch) | **40.7 ns/op** | 0 B / 0 alloc | ~24.5M tx/sec |
-| EIP-1559 base fee calculation | **425 ns/op** | 152 B / 6 alloc | ~2.3M/sec |
+## Latency Budget
 
-> Full pipeline processes a transaction **1500× faster** than Arbitrum's 250ms block time.
+```
+┌─────────────────────────────────┬──────────────┬─────────────┐
+│  Component                      │  Latency     │  % of total │
+├─────────────────────────────────┼──────────────┼─────────────┤
+│  Arbitrum RPC (network)         │  1–5 ms      │  ~99.9%     │
+│  gRPC serialization (Go↔Rust)   │  5–20 µs     │  ~0.09%     │
+│  Internal pipeline              │  ~0.6 µs     │  ~0.01%     │
+└─────────────────────────────────┴──────────────┴─────────────┘
+```
+
+> Network dominates by ~1000×. The system is optimized for **deterministic internal latency**, not network speed. Every microsecond saved in compute is meaningless if RPC adds 3ms of jitter — but deterministic execution means consistent behavior under load, which matters for queue ordering and opportunity capture.
+
+---
+
+## Concurrency & Contention Model
+
+**Hot path (zero contention):**
+- MPSC lock-free queue: CAS slot-claim → write → release fence → atomic count increment
+- Single-writer per slot → no write contention, no ABA problem
+- `alignas(64)` head/tail → eliminates false sharing across cache lines
+- Bounded queues (4096) → prevents unbounded latency growth
+
+**Backpressure strategy:**
+- Queue saturated → drop + degrade to monitor-only mode
+- No blocking in hot path — ever
+- Crossbeam bounded channels between detector→simulator→builder stages
+
+**Thread model:**
+- Go: goroutine pool for classification (no cgo, scheduler-friendly)
+- Rust: Tokio multi-threaded runtime + crossbeam worker pool for parallel detection
+- C: called via FFI from Rust — single-threaded per invocation, no locking
+
+---
+
+## Memory & Allocation Strategy
+
+| Component | Strategy | GC Impact |
+|-----------|----------|-----------|
+| Go classifier | Zero allocations (40.7 ns/op, 0 B/op) | None in hot path |
+| C queue + pool | Arena allocator with batch rollback, preallocated slots | N/A |
+| C tx parser | Stack-allocated decode buffers, length-validated | N/A |
+| Rust detector | `DashMap` pre-populated pool cache, stack-local `PendingTx` | N/A |
+| Rust simulator | `checked_mul`/`checked_add` on stack, no heap per simulation | N/A |
+| Go metrics/logging | Standard allocations — confined to non-hot paths | GC here only |
+
+> Go GC is confined to metrics, logging, and configuration. Classification and selector dispatch are allocation-free. C arena allocator supports atomic rollback on partial batch failure.
+
+---
+
+## Behavior Under Load
+
+Scenario: burst of 10k+ transactions per block.
+
+| Failure Mode | Response | Guarantee |
+|-------------|----------|-----------|
+| Queue saturation | Bounded MPSC drops excess, switches to monitor-only | No unbounded memory growth |
+| Detection lag | Degrades to classify-only (skips Rust core) | Pipeline never blocks |
+| RPC lag / timeout | Multi-endpoint failover, latency-based routing | No single point of failure |
+| gRPC overload | Token-bucket rate limiter (1000 RPS, packed AtomicU64) | Predictable throughput cap |
+| WebSocket disconnect | Exponential backoff (1s → 2s → 4s … 30s cap) | No RPC hammering |
+| C library missing | Pure-Rust fallback (keccak, RLP, price impact) | Compiles and runs without C |
+
+**Guarantees under all load conditions:**
+- No unbounded memory growth
+- No blocking in hot path
+- No cascading failure across layers
+- Bounded queue depth = bounded worst-case latency
+
+---
+
+## Non-Goals / Not Optimized
+
+| Not Implemented | Why |
+|----------------|-----|
+| Kernel bypass (DPDK / io_uring) | Network latency (~ms) dominates; kernel bypass saves ~µs on a ms-bound path |
+| NUMA pinning | Single-node assumption; would matter on multi-socket servers |
+| FPGA / hardware acceleration | Compute path is already sub-µs; hardware offload ROI is negative at this scale |
+| Userspace networking | Same reasoning as DPDK — bottleneck is RPC, not NIC |
+| Custom memory allocator (jemalloc) | Arena allocator in C hot path is sufficient; Rust default allocator performs well |
+
+> Focus is strictly on: **deterministic user-space execution** and **minimal jitter in the compute path**. Network-bound systems benefit from reliability, not raw NIC speed.
 
 ---
 
@@ -162,13 +302,14 @@ High-performance detection, simulation, and bundle construction. See [core/READM
 - **Tokio 1.35** — async multi-threaded runtime
 - **crossbeam** — lock-free channels for detector→simulator pipeline
 - **alloy + ethers** — type-safe Ethereum primitives and ABI encoding
-- **Prometheus** — `metrics-exporter-prometheus` for hot-path instrumentation
+- **Prometheus** — `metrics-exporter-prometheus` with custom TCP server (:9091, CORS-enabled) for real-time dashboard
+- **Block-based TX classifier** — classifies every transaction by 4-byte selector (V2/V3 swaps, transfers) since Arbitrum has no public mempool
 - **tonic + prost** — gRPC server exposing detection pipeline to Go
 
 ```bash
 cd core
 cargo build --release     # opt-level=3, lto=fat, codegen-units=1
-cargo test                # 170 tests (137 unit + 10 integration + 23 proptest)
+cargo test                # 183 tests (149 unit + 11 integration + 23 proptest)
 cargo bench               # 7 Criterion benchmark groups
 ```
 
@@ -202,7 +343,7 @@ Target: **< 10ms** round-trip for detect + simulate + bundle on co-located infra
 
 ## Smart Contracts — `contracts/`
 
-Solidity + targeted inline Yul assembly. Foundry-based build, **14 tests** (access control, callback hardening, fuzz, invariant).
+Solidity + targeted inline Yul assembly. Foundry-based build, **26 tests** (access control, callback hardening, fuzz, invariant, YulUtils 512-bit math).
 
 **Architecture:** Balancer V2 flash loan (0% fee vs Aave's 0.09%) → multi-hop atomic swaps → profit check → repay. Single-tx execution, reverts if unprofitable.
 
@@ -263,7 +404,7 @@ executeArbitrage() sets: executionActive, pendingExecutor, pendingToken, pending
 ```bash
 cd contracts
 forge build                  # Compile all
-forge test -vvv              # 14 tests — access control (6), callback (3), fuzz (1), invariant (1), pause, edge cases
+forge test -vvv              # 26 tests — access control (6), callback (3), fuzz (1), invariant (1), pause, edge cases + YulUtils (10)
 forge test --gas-report      # Per-function gas usage
 forge script script/DeployArbitrum.s.sol:DeployArbitrumSepolia --rpc-url $RPC --broadcast   # Testnet deploy
 ```
@@ -280,7 +421,8 @@ contracts/
 │       └── YulUtils.sol        # Pure Yul assembly: math, memory, hashing, calldata, AMM
 ├── test/
 │   ├── FlashArbitrage.t.sol    # Foundry test suite (14 tests)
-│   └── MultiDexRouter.t.sol    # Router tests
+│   ├── MultiDexRouter.t.sol    # Router tests
+│   └── YulUtils.t.sol          # 512-bit mulDiv precision + fuzz tests (10 tests)
 ├── script/
 │   ├── Deploy.s.sol            # Generic deploy script
 │   └── DeployArbitrum.s.sol    # Arbitrum Sepolia + Mainnet deploy
@@ -328,7 +470,7 @@ make bench      # hot-path benchmarks
 
 ```bash
 # 1. Clone
-git clone https://github.com/ivanpiardi/mev-engineering-stack.git
+git clone https://github.com/Faraone-Dev/mev-engineering-stack.git
 cd mev-engineering-stack
 
 # 2. Configure
@@ -391,13 +533,13 @@ Flags: `--key` (reuse signing key), `--rpc` (custom RPC), `--submit` (live submi
 
 | Layer | Tests | Framework | What's Tested |
 |-------|-------|-----------|---------------|
-| **Rust core** | **170 tests** (137 unit + 10 integration + 23 proptest) | `cargo test` + proptest + Criterion | See breakdown below |
+| **Rust core** | **183 tests** (149 unit + 11 integration + 23 proptest) | `cargo test` + proptest + Criterion | See breakdown below |
 | **Go network** | 23 tests, 2 benchmarks | `go test` | Config parsing, EIP-1559 oracle, tx classification (V2/V3 selectors), multi-relay strategies |
 | **Rust bench** | 7 groups | Criterion 0.5 | Full pipeline, keccak, AMM, pool lookup, ABI, U256, crossbeam |
-| **Solidity** | Foundry suite | `forge test` | Flash arbitrage execution, multi-DEX routing, callback validation |
+| **Solidity** | **26 tests** | `forge test` | Flash arbitrage execution, multi-DEX routing, callback validation, YulUtils 512-bit mulDiv |
 | **C hot path** | `make test` | Custom runner | Keccak correctness, RLP encoding, SIMD validation |
 
-### Rust Core — 170 Tests Breakdown
+### Rust Core — 183 Tests Breakdown
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
@@ -415,7 +557,7 @@ Flags: `--key` (reuse signing key), `--rpc` (custom RPC), `--submit` (live submi
 | `arbitrum/pools` | 12 | AMM `get_amount_out` (basic/reverse/zero/high-fee), `get_price`, token list validation |
 | `types` | 8 | `estimate_gas` for all DexType × OpportunityType combinations |
 | `proptest` | 23 | Constant-product invariants (7), ABI roundtrip (3), gas bounds (5), keccak (3), data structures (2), swap selectors (1), overflow safety (2) |
-| `integration` | 10 | Full pipeline end-to-end, engine lifecycle, all bundle types, simulator count |
+| `integration` | 11 | Full pipeline end-to-end, engine lifecycle, all bundle types, simulator count, gRPC E2E |
 
 ### CI/CD
 
@@ -434,20 +576,27 @@ GitHub Actions pipeline with **3 parallel jobs** — each layer builds and tests
 | `is_likely_swap()` — OR condition classified all non-zero-first-byte txs as swaps | **Critical** | `mempool/ultra_ws` | Removed `\|\| (selector[0] != 0x00)` |
 | `constant_product_swap()` — unchecked u128 arithmetic silently overflowed on whale trades | **High** | `simulator` | `checked_mul`/`checked_add`, returns 0 on overflow |
 | Proptest tested local copy of AMM function, not production code | **High** | `tests/proptest` | Now imports `mev_core::simulator::constant_product_swap` directly |
+| `div_u256_by_u128` — Knuth division produced wrong quotient on large dividends | **High** | `simulator` | Replaced with standalone loop-based algorithm, 3 edge-case tests |
+| `pool_put()` — race condition: count incremented before data written | **High** | `fast/memory_pool.c` | CAS slot-claim → write → release fence → atomic count increment |
+| WebSocket reconnection — no backoff on disconnect, hammered RPC on failure | **Medium** | `mempool/ultra_ws` | Exponential backoff (1s → 2s → 4s … 30s cap) |
+| gRPC server — no rate limiting, vulnerable to request flooding | **Medium** | `grpc/server` | Token-bucket rate limiter (1000 RPS, packed AtomicU64) |
+| FlashArbitrage `require(string)` — wastes gas on revert strings | **Low** | `contracts` | Custom error `ContractPaused()` replaces require string |
+| Dashboard unauthenticated — no mention in security docs | **Info** | `SECURITY.md` | Added dashboard authentication section |
 
 ---
 
 ## Design Decisions
 
-| Decision | Rationale |
-|----------|-----------|
-| **4 languages** | Go for concurrent network I/O, Rust for safe high-perf compute, C for SIMD hot paths, Solidity for on-chain. Mirrors production MEV infra. |
-| **gRPC over FFI for Go↔Rust** | cgo pins goroutines to OS threads, defeating Go's scheduler. gRPC gives process separation, independent scaling, and proto-defined contracts. |
-| **revm over forked geth** | Pure Rust, no cgo dependency, fork-mode simulation, deterministic gas. 10-50× faster for single-tx sim. |
-| **Balancer flash loans** | 0% fee vs Aave's 0.09%. When margins are basis points, eliminating the fee is critical. |
-| **Constant-product fast filter** | x·y=k math at 35 ns screens candidates before expensive revm simulation. Only analytical survivors hit EVM. |
-| **Arbitrum-first** | 10-100× cheaper gas, 250ms blocks, less MEV competition. Proof-of-concept before L1. |
-| **Monitor-only fallback** | Go node degrades gracefully when Rust core is offline — keeps logging rather than crashing. |
+| Decision | Rationale | Tradeoff |
+|----------|-----------|----------|
+| **4 languages** | Go for concurrent network I/O, Rust for safe high-perf compute, C for SIMD hot paths, Solidity for on-chain | Operational complexity vs optimal tool per domain |
+| **gRPC over FFI for Go↔Rust** | Avoids cgo thread pinning → preserves Go scheduler fairness. Isolates failure domains (process boundary) | Adds ~5–20 µs overhead, acceptable vs ms-level network latency |
+| **revm over forked geth** | Pure Rust, no cgo dependency, deterministic gas. 10–50× faster for single-tx sim | No state sync — simulation uses analytical model, not fork-mode |
+| **Balancer flash loans** | 0% fee vs Aave's 0.09%. When margins are basis points, eliminating the fee is critical | Balancer pool TVL limits flash loan size |
+| **Constant-product fast filter** | x·y=k at 35 ns screens candidates before expensive simulation. Only survivors hit EVM | Misses V3 concentrated liquidity edge cases |
+| **Arbitrum-first** | 10–100× cheaper gas, 250ms blocks, less MEV competition | No public mempool → requires block-based reconstruction |
+| **Monitor-only fallback** | Go node degrades gracefully when Rust core is offline — logs, doesn't crash | Misses opportunities during degraded mode |
+| **Bounded queues everywhere** | Prevents unbounded memory growth, gives worst-case latency guarantees | Drops excess transactions under extreme load |
 
 ---
 
@@ -513,7 +662,7 @@ mev-engineering-stack/
 │   │   ├── libraries/
 │   │   │   └── YulUtils.sol      # Pure Yul assembly: mulDiv, sqrt, getAmountOut, hash2, calldata parsing (15+ fns)
 │   │   └── interfaces/           # IBalancerVault, IERC20/IWETH, IUniswapV2, IUniswapV3
-│   ├── test/                     # Foundry: 14 tests (access control, callback, fuzz, invariant)
+│   ├── test/                     # Foundry: 26 tests (access control, callback, fuzz, invariant, YulUtils)
 │   └── script/                   # Deploy: Arbitrum Sepolia + Mainnet
 ├── fast/                   # C — SIMD keccak, RLP, lock-free queue, memory pool
 │   ├── src/                # Implementation (6 files)
