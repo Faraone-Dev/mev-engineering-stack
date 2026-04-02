@@ -1058,9 +1058,9 @@
                     <div class="bench-bar-track">
                         <div class="bench-bar-fill" style="width:4%;background:var(--green)"></div>
                     </div>
-                    <span class="bench-val" style="color:var(--green)">40.7ns</span>
+                    <span class="bench-val" style="color:var(--green)" id="classify-latency">40.7ns</span>
                 </div>
-                <div style="font-size:9px;color:var(--text-2)">0 alloc &#x2014; 24.5M tx/sec theoretical</div>
+                <div style="font-size:9px;color:var(--text-2)" id="classify-throughput">0 alloc &#x2014; 24.5M tx/sec theoretical</div>
             </div>
 
             <div class="tile">
@@ -1070,9 +1070,9 @@
                     <div class="bench-bar-track">
                         <div class="bench-bar-fill" style="width:42%;background:var(--blue)"></div>
                     </div>
-                    <span class="bench-val" style="color:var(--blue)">425ns</span>
+                    <span class="bench-val" style="color:var(--blue)" id="basefee-latency">425ns</span>
                 </div>
-                <div style="font-size:9px;color:var(--text-2)">6 allocs &#x2014; 2.3M/sec throughput</div>
+                <div style="font-size:9px;color:var(--text-2)" id="basefee-throughput">6 allocs &#x2014; 2.3M/sec throughput</div>
             </div>
 
             <div class="tile">
@@ -1314,6 +1314,20 @@
                 // Errors
                 document.getElementById('subErrors').textContent = fmt(g(m, 'mev_mempool_subscription_errors_total'));
                 document.getElementById('errDropped').textContent = fmt(dropped);
+
+                // Live latency metrics
+                var classifyNs = g(m, 'mev_classify_latency_ns');
+                if (classifyNs > 0) {
+                    document.getElementById('classify-latency').textContent = classifyNs.toFixed(1) + 'ns';
+                    var tps = classifyNs > 0 ? (1e9 / classifyNs) : 0;
+                    document.getElementById('classify-throughput').textContent = '0 alloc \u2014 ' + (tps / 1e6).toFixed(1) + 'M tx/sec measured';
+                }
+                var basefeeNs = g(m, 'mev_basefee_predict_latency_ns');
+                if (basefeeNs > 0) {
+                    document.getElementById('basefee-latency').textContent = basefeeNs < 1000 ? basefeeNs.toFixed(0) + 'ns' : (basefeeNs / 1000).toFixed(1) + '\u00B5s';
+                    var bps = basefeeNs > 0 ? (1e9 / basefeeNs) : 0;
+                    document.getElementById('basefee-throughput').textContent = (bps / 1e6).toFixed(1) + 'M/sec measured';
+                }
 
                 var rpcErrCount = 0;
                 for (var k in m) {

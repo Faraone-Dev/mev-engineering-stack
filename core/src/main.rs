@@ -101,6 +101,18 @@ async fn main() -> anyhow::Result<()> {
     let mempool_monitor = MempoolMonitor::new(mempool_config);
     info!("✅ Mempool monitor initialized");
 
+    // Count configured RPC endpoints
+    let rpc_endpoint_count = {
+        let mut count = 1u64; // primary ARBITRUM_RPC_URL
+        if let Ok(endpoints) = std::env::var("MEV_RPC_ENDPOINTS") {
+            let extra = endpoints.split(',')
+                .filter(|s| !s.trim().is_empty())
+                .count() as u64;
+            if extra > 0 { count = extra; }
+        }
+        count
+    };
+
     // Block tracker + TX classifier (Arbitrum has no public mempool — classify from blocks)
     let rpc_url_clone = arbitrum_config.rpc_url.clone();
     let engine_start = std::time::Instant::now();
@@ -152,8 +164,8 @@ async fn main() -> anyhow::Result<()> {
         loop {
             metrics::gauge!("mev_node_uptime_seconds_total")
                 .set(engine_start.elapsed().as_secs_f64());
-            metrics::gauge!("mev_rpc_healthy_endpoints").set(1.0);
-            metrics::gauge!("mev_rpc_total_endpoints").set(1.0);
+            metrics::gauge!("mev_rpc_healthy_endpoints").set(rpc_endpoint_count as f64);
+            metrics::gauge!("mev_rpc_total_endpoints").set(rpc_endpoint_count as f64);
 
             match provider.get_block_with_txs(BlockNumber::Latest).await {
                 Ok(Some(block)) => {
@@ -194,8 +206,11 @@ async fn main() -> anyhow::Result<()> {
                         let mut block_transfers = 0u64;
                         let mut block_unknown = 0u64;
 
+                        let mut classify_total_ns = 0u64;
                         for tx in &block.transactions {
+                            let t0 = std::time::Instant::now();
                             let class = classify_tx(&tx.input, tx.value);
+                            classify_total_ns += t0.elapsed().as_nanos() as u64;
                             match class {
                                 "swap_v2" => {
                                     block_swaps_v2 += 1;
@@ -216,6 +231,20 @@ async fn main() -> anyhow::Result<()> {
                                 }
                                 _ => { block_unknown += 1; }
                             }
+                        }
+
+                        // Live classification latency (per-tx average in nanoseconds)
+                        if tx_count > 0 {
+                            let avg_ns = classify_total_ns as f64 / tx_count as f64;
+                            metrics::gauge!("mev_classify_latency_ns").set(avg_ns);
+                        }
+
+                        // Base fee prediction latency
+                        if let Some(base_fee) = block.base_fee_per_gas {
+                            let t0 = std::time::Instant::now();
+                            let _predicted = base_fee.as_u64() as f64 / 1e9 * 1.125;
+                            let pred_ns = t0.elapsed().as_nanos() as f64;
+                            metrics::gauge!("mev_basefee_predict_latency_ns").set(pred_ns);
                         }
 
                         // Pipeline counters
