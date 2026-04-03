@@ -13,17 +13,21 @@ use super::mev;
 use super::mev::mev_engine_server::MevEngine;
 use crate::config::Config;
 use crate::detector::OpportunityDetector;
+use crate::simulator::evm::{BlockContext, EvmForkSimulator, ForkDB};
 use crate::simulator::EvmSimulator;
 use crate::builder::BundleBuilder;
 use crate::types::{PendingTx, OpportunityType};
+use revm::primitives::{Address, U256};
 
 /// Capacity for the broadcast channel used by StreamOpportunities.
 const BROADCAST_CAPACITY: usize = 256;
 
 /// gRPC server wrapping the full MEV pipeline
 pub struct MevGrpcServer {
+    config: Arc<Config>,
     detector: Arc<OpportunityDetector>,
     simulator: Arc<EvmSimulator>,
+    fork_simulator: Option<Arc<EvmForkSimulator>>,
     builder: Arc<BundleBuilder>,
     start_time: Instant,
     /// Broadcast sender — every successful detection is published here
@@ -32,9 +36,27 @@ pub struct MevGrpcServer {
 }
 
 impl MevGrpcServer {
+    fn fork_sim_enabled() -> bool {
+        std::env::var("MEV_ENABLE_FORK_SIM")
+            .map(|v| {
+                matches!(
+                    v.trim().to_ascii_lowercase().as_str(),
+                    "1" | "true" | "yes" | "on"
+                )
+            })
+            .unwrap_or(false)
+    }
+
     pub fn new(config: Arc<Config>) -> Self {
         let (opportunity_tx, _) = broadcast::channel(BROADCAST_CAPACITY);
         let mut builder = BundleBuilder::new(config.clone());
+        let fork_simulator = if Self::fork_sim_enabled() {
+            info!("Stage 2 fork simulation enabled (MEV_ENABLE_FORK_SIM=1)");
+            Some(Arc::new(EvmForkSimulator::new(config.clone())))
+        } else {
+            info!("Stage 2 fork simulation disabled (set MEV_ENABLE_FORK_SIM=1 to enable)");
+            None
+        };
 
         if let Some(contract_address) = config
             .chains
@@ -47,8 +69,10 @@ impl MevGrpcServer {
         }
 
         Self {
+            config: config.clone(),
             detector: Arc::new(OpportunityDetector::new(config.clone())),
             simulator: Arc::new(EvmSimulator::new(config.clone())),
+            fork_simulator,
             builder: Arc::new(builder),
             start_time: Instant::now(),
             opportunity_tx,
@@ -119,6 +143,8 @@ impl MevEngine for MevGrpcServer {
         let proto_tx = request.into_inner();
 
         let pending_tx = Self::decode_tx(&proto_tx)?;
+        let pending_tx_from = pending_tx.from;
+        let pending_tx_nonce = pending_tx.nonce;
 
         // Run detector
         let opportunities = self.detector.process_tx(pending_tx).await;
@@ -135,10 +161,48 @@ impl MevEngine for MevGrpcServer {
         let mut proto_opps = Vec::with_capacity(opportunities.len());
 
         for opp in &opportunities {
-            let sim = self.simulator.simulate(opp).await;
-            if !sim.success || sim.profit <= 0 {
+            let stage1_sim = self.simulator.simulate(opp).await;
+            if !stage1_sim.success || stage1_sim.profit <= 0 {
                 debug!(kind = ?opp.opportunity_type, "Simulation rejected opportunity");
                 continue;
+            }
+
+            // Optional Stage 2: fork-mode revm execution for final validation.
+            if let Some(fork_sim) = &self.fork_simulator {
+                let now_ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let max_fee = self.config.strategy.max_gas_price_gwei as u128 * 1_000_000_000;
+                let base_fee = max_fee.max(20_000_000);
+
+                fork_sim.update_block(BlockContext {
+                    number: proto_tx.target_block,
+                    timestamp: now_ts,
+                    base_fee,
+                    coinbase: [0u8; 20],
+                });
+
+                let mut fork_db = ForkDB::new();
+                let executor = Address::from(pending_tx_from);
+
+                // Ensure caller has funds so revm does not reject txs on balance checks.
+                fork_db.insert_account(
+                    executor,
+                    U256::from(10_000_000_000_000_000_000u128),
+                    pending_tx_nonce,
+                    vec![],
+                );
+
+                let stage2_sim = fork_sim.simulate_opportunity(&mut fork_db, opp, executor);
+                if !stage2_sim.success || stage2_sim.profit <= 0 {
+                    debug!(
+                        kind = ?opp.opportunity_type,
+                        error = ?stage2_sim.error,
+                        "Fork simulation rejected opportunity"
+                    );
+                    continue;
+                }
             }
 
             let mut proto_opp = Self::encode_opportunity(opp);
@@ -243,10 +307,17 @@ impl MevEngine for MevGrpcServer {
         &self,
         _request: Request<mev::StatusRequest>,
     ) -> Result<Response<mev::StatusResponse>, Status> {
+        let stage1_count = self.simulator.count().await;
+        let stage2_count = self
+            .fork_simulator
+            .as_ref()
+            .map(|s| s.metrics().total_simulations)
+            .unwrap_or(0);
+
         Ok(Response::new(mev::StatusResponse {
             running: true,
             opportunities_detected: self.detector.count().await,
-            simulations_run: self.simulator.count().await,
+            simulations_run: stage1_count + stage2_count,
             bundles_built: self.builder.count().await,
             uptime_seconds: self.start_time.elapsed().as_secs(),
         }))
