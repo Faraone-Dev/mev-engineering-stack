@@ -18,7 +18,7 @@ service MevEngine {
 
 | RPC | Direction | Description |
 |-----|-----------|-------------|
-| `DetectOpportunity` | Unary | Single classified tx → full pipeline (detect + simulate + build) → detection result |
+| `DetectOpportunity` | Unary | Single classified tx → detect → Stage 1 simulate → optional Stage 2 fork simulate → build → detection result |
 | `StreamOpportunities` | Server-streaming | Subscribe to opportunities in real time via `tokio::broadcast` channel. Supports `min_profit` threshold filter. Handles subscriber lag gracefully. |
 | `GetStatus` | Unary | Engine health, uptime (tracked via `Instant`), detection count |
 
@@ -29,12 +29,16 @@ Go pipeline             proto/mev.proto              Rust core
 ──────────               ──────────                 ──────────
 ClassifiedTransaction ──▶ gRPC (tonic) ──────────▶ OpportunityDetector
                                                         │
-                                                   EvmSimulator
+                                              Stage 1: EvmSimulator
+                                                        │
+                                      Stage 2: EvmForkSimulator (optional)
                                                         │
                                                    BundleBuilder
                                                         │
 DetectionResult ◀─────── gRPC response ◀──────────── Bundle
 ```
+
+Stage 2 fork-mode validation is runtime-gated via `MEV_ENABLE_FORK_SIM=1`.
 
 ## Types
 

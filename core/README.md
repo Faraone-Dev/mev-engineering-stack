@@ -1,6 +1,6 @@
 # mev-core
 
-**Rust MEV Detection Engine** — sub-microsecond opportunity detection, EVM simulation, and bundle construction.
+**Rust MEV Detection Engine** — sub-microsecond opportunity detection, two-stage EVM simulation (AMM math + revm fork), and bundle construction.
 
 ## Build
 
@@ -9,6 +9,10 @@ cargo build --release     # opt-level=3, lto=fat, codegen-units=1
 cargo test                # unit + property-based tests
 cargo bench               # Criterion benchmarks (7 groups)
 ```
+
+Runtime switch:
+- `MEV_ENABLE_FORK_SIM=1` enables Stage 2 fork-mode revm validation in the gRPC pipeline.
+- By default Stage 2 is disabled and only Stage 1 AMM math filtering runs.
 
 Release profile: `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip=true`.
 
@@ -23,13 +27,13 @@ Release profile: `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`,
                     ┌────────────┘         │         └────────────┐
                     ▼                      ▼                      ▼
            ┌────────────────┐    ┌──────────────────┐   ┌─────────────────┐
-           │ Detector       │    │ EvmSimulator     │   │ BundleBuilder   │
-           │                │    │                  │   │                 │
+           │ Detector       │    │ Simulator        │   │ BundleBuilder   │
+           │                │    │ Stage 1: AMM     │   │                 │
            │ Arbitrage      │───▶│ V2 const_product │──▶│ encode_arb_call │
            │ Backrun        │    │ V3 concentrated  │   │ encode_liq_call │
-           │ Liquidation    │    │ auto-route by    │   │ swap_path encode│
-           │ MultiThreaded  │    │ pool type        │   │ Flashbots format│
-           └────────┬───────┘    └──────────────────┘   └─────────────────┘
+           │ Liquidation    │    │ Stage 2: revm    │   │ swap_path encode│
+           │ MultiThreaded  │    │ fork execution   │   │ Flashbots format│
+           └────────────────┘    └──────────────────┘   └─────────────────┘
                     │
                     │ FFI (optional)
                     ▼
@@ -49,8 +53,9 @@ Release profile: `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`,
 | ├ backrun | `detector/backrun.rs` | Price recovery capture after large swaps |
 | ├ liquidation | `detector/liquidation.rs` | Under-collateralized position liquidation (Aave V3, Compound V3, Morpho) |
 | └ multi_threaded | `detector/multi_threaded.rs` | Parallel worker pool with crossbeam channels |
-| **simulator** | `src/simulator/` | EVM simulation |
-| | | V2 constant-product x·y=k fast filter (35 ns) + V3 concentrated liquidity swap (`sqrtPriceX96` → virtual reserves, auto-routing by `is_v3` flag) + revm 8.0 fork validation. Checked arithmetic on all paths. |
+| **simulator** | `src/simulator/` | Two-stage MEV simulation pipeline |
+| | | **Stage 1:** V2 constant-product x·y=k fast filter (35 ns) + V3 concentrated liquidity swap (`sqrtPriceX96` → virtual reserves, auto-routing by `is_v3` flag). Checked arithmetic on all paths. |
+| | | **Stage 2:** `EvmForkSimulator` — revm 8.0 fork-mode execution (`CacheDB`), full EVM state validation, state diff extraction, revert/panic decoding, gas estimation. Only Stage 1 survivors reach Stage 2 (~50–200 µs per call). |
 | **builder** | `src/builder/` | Bundle construction |
 | | | ABI encoding, swap path packing, gas pricing, Flashbots-compatible format |
 | **grpc** | `src/grpc/` | gRPC server (tonic 0.11) |
@@ -101,13 +106,13 @@ HTML reports: `target/criterion/report/index.html`
 
 ## Tests
 
-**170 tests** — full coverage across all modules. Run with `cargo test`.
+**179 tests** — full coverage across all modules. Run with `cargo test`.
 
 ```
-test result: ok. 137 passed (unit) + 10 passed (integration) + 23 passed (proptest) = 170 total
+test result: ok. 146 passed (unit) + 10 passed (integration) + 23 passed (proptest) = 179 total
 ```
 
-### Unit Tests (137)
+### Unit Tests (146)
 
 | Module | Tests | What's Verified |
 |--------|-------|-----------------|
@@ -116,6 +121,7 @@ test result: ok. 137 passed (unit) + 10 passed (integration) + 23 passed (propte
 | `detector/liquidation` | 4 | Liquidatable position detection, healthy skip, close factor limits, stale pruning |
 | `detector/multi_threaded` | 1 | Parallel swap simulation |
 | `simulator` | 19 | Constant-product math (happy path, zero reserves, fee=100%, u128 overflow), pool cache (`load_pools`, `update_pool`, `get_pool`, `pool_reserves` cache hit/fallback/zero-addr), `ordered_pair` canonical ordering, `simulate` (arbitrage, backrun, liquidation), `simulate_bundle`, `success_rate`, `estimate_tx_gas`, simulation count tracking |
+| `simulator/evm` | 9 | `ForkDB` insert/query and storage slots, revm simple ETH transfer, revert string decoding, panic code decoding, calldata encode roundtrip, profit extraction from balance diff, metrics counter increment, `BlockContext` update |
 | `builder` | 16 | ABI encoding (`address` with/without `0x`, empty, `u256` zero/max), arbitrage/backrun/liquidation bundle construction, swap path encoding (2-hop, empty, missing pool fallback), build without contract → error, build count increment |
 | `config` | 9 | Serde JSON roundtrip (full config + chain config), save/reload to disk, `from_env` fallback to defaults, Ethereum/Arbitrum chain presence, strategy defaults, performance non-zero |
 | `ffi/hot_path` | 24 | Keccak-256 known vectors (empty → `0xc5d246...`, "hello" → `0x1c8aff...`), function selectors (`transfer` = `0xa9059cbb`, `approve` = `0x095ea7b3`, V2 swap), `address_eq` (same/different/zero), RLP encoding (address length+prefix, u256 zero/small/large), `calc_price_impact_batch` (basic + zero-reserve), `OpportunityQueue` (new/push/pop/empty/FIFO order), `TxBuffer` (new/empty/write-read/512 cap), `SwapInfoFFI` default |

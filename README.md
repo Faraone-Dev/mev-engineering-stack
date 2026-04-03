@@ -16,7 +16,7 @@
 - ⚡ End-to-end pipeline: **~600 ns per opportunity** (sub-microsecond internal processing, excluding network latency)
 - 🧠 Four-language architecture: Go (network I/O), Rust (detection + simulation), C (SIMD hot paths), Solidity (on-chain execution)
 - 🔄 Fault-tolerant: graceful degradation across all layers — no panics, no silent failures
-- 📊 230+ tests, 7 benchmark groups, real-time Prometheus dashboard
+- 📊 240+ tests, 7 benchmark groups, real-time Prometheus dashboard
 - 🔒 Constructive MEV only — no sandwich attacks, no front-running
 
 **Focus:** high-performance systems, lock-free concurrency, and reliability — not trading strategies.
@@ -32,7 +32,7 @@ This project explores how far a single developer can push:
 - **Low-latency system design** — sub-microsecond processing pipeline with Criterion-verified benchmarks
 - **Lock-free concurrency** — CAS queues, atomic operations, zero-allocation hot paths at 40.7 ns/op
 - **Multi-language architecture tradeoffs** — gRPC vs FFI, Go scheduler vs cgo, Yul vs Solidity
-- **Deterministic simulation** — local EVM via revm, constant-product AMM math, V3 concentrated liquidity
+- **Two-stage simulation** — AMM math fast filter (~35 ns) → revm 8.0 fork execution (~50–200 µs) for full EVM validation
 - **Production-grade fault tolerance** — exponential backoff, graceful degradation, monitor-only fallback
 
 The goal is not profitability, but engineering performance and system reliability.
@@ -138,6 +138,9 @@ Real-time monitoring dashboard polling Prometheus metrics every 2 seconds. Singl
 ```bash
 # 1. Start the Rust engine (serves Prometheus on :9091)
 cargo run --release --bin mev-engine --manifest-path core/Cargo.toml
+
+# Optional: enable Stage 2 revm fork validation in gRPC pipeline
+MEV_ENABLE_FORK_SIM=1 cargo run --release --bin mev-engine --manifest-path core/Cargo.toml
 
 # 2. Open dashboard in browser
 open dashboard/index.html
@@ -298,7 +301,7 @@ go test -bench . ./...    # selector + gas oracle benchmarks
 
 High-performance detection, simulation, and bundle construction. See [core/README.md](core/README.md) for full documentation.
 
-- **revm 8.0** — local EVM simulation without forked geth
+- **revm 8.0** — two-stage simulation: AMM math fast filter (35 ns) + fork-mode EVM execution for full state validation
 - **Tokio 1.35** — async multi-threaded runtime
 - **crossbeam** — lock-free channels for detector→simulator pipeline
 - **alloy + ethers** — type-safe Ethereum primitives and ABI encoding
@@ -309,7 +312,7 @@ High-performance detection, simulation, and bundle construction. See [core/READM
 ```bash
 cd core
 cargo build --release     # opt-level=3, lto=fat, codegen-units=1
-cargo test                # 183 tests (149 unit + 11 integration + 23 proptest)
+cargo test                # 192 tests (158 unit + 11 integration + 23 proptest)
 cargo bench               # 7 Criterion benchmark groups
 ```
 
@@ -317,15 +320,15 @@ cargo bench               # 7 Criterion benchmark groups
 
 ```
 PendingTx → parse_swap() → ArbitrageDetector  ──┐
-            (8 selectors,   BackrunDetector   ────┼─▶ EvmSimulator ──▶ BundleBuilder ──▶ Bundle
-             checked math)  LiquidationDetector─┘    (V2 + V3 AMM)     (ABI encode)
+            (8 selectors,   BackrunDetector   ────┼─▶ Stage 1: AMM Math ──▶ Stage 2: revm Fork ──▶ BundleBuilder ──▶ Bundle
+             checked math)  LiquidationDetector─┘    (35 ns filter)        (full EVM validate)     (ABI encode)
 ```
 
 - **ArbitrageDetector**: Cross-DEX price discrepancy with cached pool state, checked arithmetic
 - **BackrunDetector**: Price recovery capture after large swaps with impact threshold
 - **LiquidationDetector**: Aave V3, Compound V3, Morpho position tracking with close factor limits
 - **MultiThreaded**: Parallel worker pool via crossbeam channels
-- **EvmSimulator**: V2 constant-product (35 ns) + V3 concentrated liquidity via `sqrtPriceX96` → virtual reserves conversion, auto-routing by pool type
+- **Simulator (two-stage)**: Stage 1 — V2 constant-product (35 ns) + V3 concentrated liquidity via `sqrtPriceX96`, auto-routing by pool type. Stage 2 — `EvmForkSimulator` runs survivors through revm 8.0 fork execution with `CacheDB`, full state diff extraction, and revert decoding
 
 ### gRPC Bridge (Go ↔ Rust)
 
@@ -533,13 +536,13 @@ Flags: `--key` (reuse signing key), `--rpc` (custom RPC), `--submit` (live submi
 
 | Layer | Tests | Framework | What's Tested |
 |-------|-------|-----------|---------------|
-| **Rust core** | **183 tests** (149 unit + 11 integration + 23 proptest) | `cargo test` + proptest + Criterion | See breakdown below |
+| **Rust core** | **192 tests** (158 unit + 11 integration + 23 proptest) | `cargo test` + proptest + Criterion | See breakdown below |
 | **Go network** | 23 tests, 2 benchmarks | `go test` | Config parsing, EIP-1559 oracle, tx classification (V2/V3 selectors), multi-relay strategies |
 | **Rust bench** | 7 groups | Criterion 0.5 | Full pipeline, keccak, AMM, pool lookup, ABI, U256, crossbeam |
 | **Solidity** | **26 tests** | `forge test` | Flash arbitrage execution, multi-DEX routing, callback validation, YulUtils 512-bit mulDiv |
 | **C hot path** | `make test` | Custom runner | Keccak correctness, RLP encoding, SIMD validation |
 
-### Rust Core — 183 Tests Breakdown
+### Rust Core — 192 Tests Breakdown
 
 | Module | Tests | Coverage |
 |--------|-------|----------|
@@ -548,6 +551,7 @@ Flags: `--key` (reuse signing key), `--rpc` (custom RPC), `--submit` (live submi
 | `detector/liquidation` | 4 | Liquidation detection, healthy skip, close factor, stale pruning |
 | `detector/multi_threaded` | 1 | Parallel swap simulation |
 | `simulator` | 19 | Constant-product math (happy/zero/overflow/fee=100%), pool cache (load/update/get/reserves fallback), simulate (arb/backrun/liquidation/bundle), success rate |
+| `simulator/evm` | 9 | ForkDB insert/query + storage slots, revm ETH transfer, revert/panic decoding, calldata encode roundtrip, profit extraction, metrics counter, BlockContext update |
 | `builder` | 16 | ABI encoding, all 3 bundle types, swap path (2-hop/empty/missing pool), no-contract error, count |
 | `config` | 9 | Serde roundtrip, save/reload, `from_env` fallback, chain defaults, strategy, performance |
 | `ffi/hot_path` | 24 | Keccak-256 known vectors, function selectors (`transfer`/`approve`/V2 swap), `address_eq`, RLP encoding, `OpportunityQueue` FIFO, `TxBuffer` cap, `SwapInfoFFI` |
@@ -591,7 +595,7 @@ GitHub Actions pipeline with **3 parallel jobs** — each layer builds and tests
 |----------|-----------|----------|
 | **4 languages** | Go for concurrent network I/O, Rust for safe high-perf compute, C for SIMD hot paths, Solidity for on-chain | Operational complexity vs optimal tool per domain |
 | **gRPC over FFI for Go↔Rust** | Avoids cgo thread pinning → preserves Go scheduler fairness. Isolates failure domains (process boundary) | Adds ~5–20 µs overhead, acceptable vs ms-level network latency |
-| **revm over forked geth** | Pure Rust, no cgo dependency, deterministic gas. 10–50× faster for single-tx sim | No state sync — simulation uses analytical model, not fork-mode |
+| **revm over forked geth** | Pure Rust, no cgo dependency, deterministic gas. Two-stage: AMM math filter (35 ns) screens candidates, revm fork execution validates survivors | revm fork adds ~50–200 µs per call, justified only for Stage 1 survivors |
 | **Balancer flash loans** | 0% fee vs Aave's 0.09%. When margins are basis points, eliminating the fee is critical | Balancer pool TVL limits flash loan size |
 | **Constant-product fast filter** | x·y=k at 35 ns screens candidates before expensive simulation. Only survivors hit EVM | Misses V3 concentrated liquidity edge cases |
 | **Arbitrum-first** | 10–100× cheaper gas, 250ms blocks, less MEV competition | No public mempool → requires block-based reconstruction |
