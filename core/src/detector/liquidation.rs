@@ -6,11 +6,11 @@
 //! using flash loans.
 
 use crate::config::Config;
-use crate::types::{Opportunity, OpportunityType, DexType};
+use crate::types::{Opportunity, OpportunityType, DexType, PoolState};
 use std::collections::HashMap;
 use std::sync::Arc;
 use parking_lot::RwLock;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 /// Position data from lending protocol
 #[derive(Debug, Clone)]
@@ -75,6 +75,8 @@ pub struct LiquidationDetector {
     config: Arc<Config>,
     /// Active positions indexed by user address
     positions: Arc<RwLock<HashMap<[u8; 20], Vec<Position>>>>,
+    /// Pool cache for resolving swap routes (debt_token → collateral_token)
+    pool_cache: Arc<RwLock<HashMap<[u8; 20], PoolState>>>,
     /// Running count of liquidatable positions found
     found_count: std::sync::atomic::AtomicU64,
 }
@@ -84,8 +86,30 @@ impl LiquidationDetector {
         Self {
             config,
             positions: Arc::new(RwLock::new(HashMap::new())),
+            pool_cache: Arc::new(RwLock::new(HashMap::new())),
             found_count: std::sync::atomic::AtomicU64::new(0),
         }
+    }
+
+    /// Load pool states for swap route resolution
+    pub fn load_pools(&self, pools: Vec<PoolState>) {
+        let mut cache = self.pool_cache.write();
+        for pool in pools {
+            cache.insert(pool.address, pool);
+        }
+    }
+
+    /// Resolve a pool for the (token_a, token_b) swap. Returns address and fee.
+    fn resolve_pool_for_pair(&self, token_a: &[u8; 20], token_b: &[u8; 20]) -> Option<([u8; 20], u32)> {
+        let cache = self.pool_cache.read();
+        for pool in cache.values() {
+            let matches = (pool.token0 == *token_a && pool.token1 == *token_b)
+                || (pool.token0 == *token_b && pool.token1 == *token_a);
+            if matches {
+                return Some((pool.address, pool.fee));
+            }
+        }
+        None
     }
 
     /// Bulk update tracked positions (e.g. from event indexer)
@@ -178,6 +202,22 @@ impl LiquidationDetector {
             "Liquidation opportunity found"
         );
 
+        // Resolve a pool for the collateral → debt swap
+        let (pool_addr, pool_fee) = match self.resolve_pool_for_pair(
+            &position.collateral_token,
+            &position.debt_token,
+        ) {
+            Some(p) => p,
+            None => {
+                warn!(
+                    collateral = ?position.collateral_token,
+                    debt = ?position.debt_token,
+                    "No pool found for liquidation swap route, skipping"
+                );
+                return None;
+            }
+        };
+
         Some(Opportunity {
             opportunity_type: OpportunityType::Liquidation,
             token_in: format!("0x{}", hex::encode(position.debt_token)),
@@ -187,8 +227,8 @@ impl LiquidationDetector {
             gas_estimate: gas,
             deadline: u64::MAX, // Liquidations are valid as long as health < 1
             path: vec![DexType::UniswapV3],
-            pool_addresses: vec![],
-            pool_fees: vec![],
+            pool_addresses: vec![pool_addr],
+            pool_fees: vec![pool_fee],
             target_tx: None,
         })
     }

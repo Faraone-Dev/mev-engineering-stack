@@ -273,7 +273,7 @@ impl ArbitrageDetector {
         let weth = tokens[0].1;
         
         // Two-hop: WETH -> X -> WETH
-        for (name, token) in tokens.iter().skip(1) {
+        for (_name, token) in tokens.iter().skip(1) {
             if let Some(opp) = self.find_two_hop_arb(weth, *token, amount).await {
                 opportunities.push(opp);
             }
@@ -285,7 +285,7 @@ impl ArbitrageDetector {
             let mut best_ratio = 0.0f64;
             let mut best_pair = String::new();
             
-            for (name, token) in tokens.iter().skip(1) {
+            for (_name, token) in tokens.iter().skip(1) {
                 let pools_first = self.pool_manager.get_pools(weth, *token).await;
                 let pools_second = self.pool_manager.get_pools(*token, weth).await;
                 
@@ -308,7 +308,7 @@ impl ArbitrageDetector {
                         let ratio = amount_out.as_u128() as f64 / amount.as_u128() as f64;
                         if ratio > best_ratio {
                             best_ratio = ratio;
-                            best_pair = name.to_string();
+                            best_pair = _name.to_string();
                         }
                     }
                 }

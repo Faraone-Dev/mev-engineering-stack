@@ -42,6 +42,7 @@ const ARBITRUM_CHAIN_ID: u64 = 42161;
 const SIM_GAS_LIMIT: u64 = 1_500_000;
 
 /// Balancer Vault on Arbitrum — flash loan entry point
+#[allow(dead_code)]
 const BALANCER_VAULT: [u8; 20] = [
     0xBA, 0x12, 0x22, 0x22, 0x22, 0x8d, 0x8B, 0xa4, 0x45, 0x95,
     0x8a, 0x75, 0xa0, 0x70, 0x4d, 0x56, 0x6B, 0xF2, 0xC8, 0x00,
@@ -74,6 +75,7 @@ impl Default for BlockContext {
 
 /// Account state fetched from RPC and cached locally.
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 struct CachedAccount {
     pub balance: U256,
     pub nonce: u64,
@@ -406,7 +408,7 @@ impl EvmForkSimulator {
         let block_ctx = self.block_ctx.read().clone();
 
         let mut total_gas: u64 = 0;
-        let mut all_changes = Vec::new();
+        let all_changes = Vec::new();
         let mut last_output = vec![];
 
         for (idx, tx) in bundle.transactions.iter().enumerate() {

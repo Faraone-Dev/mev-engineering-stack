@@ -22,13 +22,6 @@ use std::time::Instant;
 use parking_lot::RwLock;
 use tracing::{debug, warn, info};
 
-/// Default reserves used ONLY when pool cache has no data for a pair.
-/// In production the pool refresh loop should populate the cache before
-/// the simulator is invoked hot-path.
-const DEFAULT_WETH_RESERVE: u128 = 5_000_000_000_000_000_000_000; // 5000 ETH
-const DEFAULT_USDC_RESERVE: u128 = 10_000_000_000_000;             // 10M USDC (6 dec)
-const DEFAULT_FEE_BPS: u128 = 30;                                   // 0.30%
-
 /// EVM Simulator for transaction simulation
 pub struct EvmSimulator {
     config: Arc<Config>,
@@ -83,77 +76,71 @@ impl EvmSimulator {
         self.pool_cache.read().get(address).cloned()
     }
 
-    /// Look up reserves for a specific pool address, falling back to defaults.
-    fn pool_reserves(&self, pool_addr: &[u8; 20]) -> (u128, u128, u128) {
-        if *pool_addr != [0u8; 20] {
-            if let Some(pool) = self.pool_cache.read().get(pool_addr) {
-                return (pool.reserve0, pool.reserve1, pool.fee as u128);
-            }
-            warn!(pool = ?pool_addr, "Pool not in cache, using default reserves");
+    /// Look up reserves for a specific pool address.
+    /// Returns None if the pool is not in cache — callers must handle the miss.
+    fn pool_reserves(&self, pool_addr: &[u8; 20]) -> Option<(u128, u128, u128)> {
+        if *pool_addr == [0u8; 20] {
+            warn!("Pool address is zero, cannot look up reserves");
+            return None;
         }
-        (DEFAULT_WETH_RESERVE, DEFAULT_USDC_RESERVE, DEFAULT_FEE_BPS)
+        if let Some(pool) = self.pool_cache.read().get(pool_addr) {
+            return Some((pool.reserve0, pool.reserve1, pool.fee as u128));
+        }
+        warn!(pool = ?pool_addr, "Pool not in cache — refusing to simulate with default reserves");
+        None
     }
 
     /// Look up full pool state including V3 fields.
-    fn pool_state_full(&self, pool_addr: &[u8; 20]) -> PoolStateSnapshot {
-        if *pool_addr != [0u8; 20] {
-            if let Some(pool) = self.pool_cache.read().get(pool_addr) {
-                return PoolStateSnapshot {
-                    reserve0: pool.reserve0,
-                    reserve1: pool.reserve1,
-                    fee: pool.fee as u128,
-                    sqrt_price_x96: pool.sqrt_price_x96,
-                    liquidity: pool.liquidity,
-                    is_v3: pool.is_v3,
-                    current_tick: pool.current_tick,
-                    tick_spacing: pool.tick_spacing,
-                    ticks: pool.ticks.clone(),
-                };
-            }
+    /// Returns None if the pool is not in cache.
+    fn pool_state_full(&self, pool_addr: &[u8; 20]) -> Option<PoolStateSnapshot> {
+        if *pool_addr == [0u8; 20] {
+            return None;
         }
-        PoolStateSnapshot {
-            reserve0: DEFAULT_WETH_RESERVE,
-            reserve1: DEFAULT_USDC_RESERVE,
-            fee: DEFAULT_FEE_BPS,
-            sqrt_price_x96: 0,
-            liquidity: 0,
-            is_v3: false,
-            current_tick: 0,
-            tick_spacing: 0,
-            ticks: vec![],
-        }
+        let pool = self.pool_cache.read().get(pool_addr)?.clone();
+        Some(PoolStateSnapshot {
+            reserve0: pool.reserve0,
+            reserve1: pool.reserve1,
+            fee: pool.fee as u128,
+            sqrt_price_x96: pool.sqrt_price_x96,
+            liquidity: pool.liquidity,
+            is_v3: pool.is_v3,
+            current_tick: pool.current_tick,
+            tick_spacing: pool.tick_spacing,
+            ticks: pool.ticks.clone(),
+        })
     }
 
     /// Execute a swap against a pool, automatically choosing V2 or V3 math.
+    /// Returns None if the pool is not in cache.
     fn swap_through_pool(
         &self,
         amount_in: u128,
         pool_addr: &[u8; 20],
         fee_override: Option<u128>,
         zero_for_one: bool,
-    ) -> u128 {
-        let snap = self.pool_state_full(pool_addr);
+    ) -> Option<u128> {
+        let snap = self.pool_state_full(pool_addr)?;
         let fee = fee_override.unwrap_or(snap.fee);
 
         if snap.is_v3 && snap.sqrt_price_x96 > 0 && snap.liquidity > 0 {
             if !snap.ticks.is_empty() {
                 // Full multi-tick traversal when tick data is available
-                multi_tick_swap(
+                Some(multi_tick_swap(
                     amount_in, snap.sqrt_price_x96, snap.liquidity,
                     snap.current_tick, &snap.ticks, fee, zero_for_one,
-                )
+                ))
             } else {
                 // Single-range approximation when tick data is unavailable
-                concentrated_liquidity_swap(
+                Some(concentrated_liquidity_swap(
                     amount_in, snap.sqrt_price_x96, snap.liquidity,
                     if zero_for_one { snap.reserve0 } else { snap.reserve1 },
                     if zero_for_one { snap.reserve1 } else { snap.reserve0 },
                     fee, zero_for_one,
-                )
+                ))
             }
         } else {
             let (ri, ro) = if zero_for_one { (snap.reserve0, snap.reserve1) } else { (snap.reserve1, snap.reserve0) };
-            constant_product_swap(amount_in, ri, ro, fee)
+            Some(constant_product_swap(amount_in, ri, ro, fee))
         }
     }
 
@@ -178,6 +165,30 @@ impl EvmSimulator {
 
     /// Simulate an opportunity against forked state
     pub async fn simulate(&self, opportunity: &Opportunity) -> SimulationResult {
+        let timeout = std::time::Duration::from_millis(
+            self.config.performance.simulation_timeout_ms,
+        );
+
+        match tokio::time::timeout(timeout, self.simulate_inner(opportunity)).await {
+            Ok(result) => result,
+            Err(_) => {
+                warn!(
+                    kind = ?opportunity.opportunity_type,
+                    timeout_ms = self.config.performance.simulation_timeout_ms,
+                    "Simulation timed out"
+                );
+                SimulationResult {
+                    success: false,
+                    profit: 0,
+                    gas_used: 0,
+                    error: Some("Simulation timed out".into()),
+                    state_changes: vec![],
+                }
+            }
+        }
+    }
+
+    async fn simulate_inner(&self, opportunity: &Opportunity) -> SimulationResult {
         let start = Instant::now();
         self.count.fetch_add(1, Ordering::Relaxed);
 
@@ -191,7 +202,7 @@ impl EvmSimulator {
         self.total_latency_us.fetch_add(latency, Ordering::Relaxed);
 
         match result {
-            Ok(mut sim) => {
+            Ok(sim) => {
                 if sim.success && sim.profit > 0 {
                     self.success_count.fetch_add(1, Ordering::Relaxed);
                 }
@@ -235,13 +246,12 @@ impl EvmSimulator {
             // Track balance changes
             let tip = tx.max_priority_fee_per_gas.unwrap_or(1_000_000_000);
             let gas_cost = gas as i128 * tip as i128;
+            total_profit -= gas_cost;
 
-            // For the last tx in an arb bundle, profit should exceed costs
+            // Last tx in an arb/liquidation bundle extracts profit —
+            // model the revenue as tx.value (profit withdrawal calldata)
             if idx == bundle.transactions.len() - 1 {
-                // Simulate flash loan repay + profit extraction
-                total_profit -= gas_cost;
-            } else {
-                total_profit -= gas_cost;
+                total_profit += tx.value as i128;
             }
 
             // Record state changes from each tx
@@ -282,13 +292,15 @@ impl EvmSimulator {
         // Step 2: Swap through entry pool (buy mid-token)
         let entry_addr = opp.pool_addresses.first().copied().unwrap_or([0u8; 20]);
         let entry_fee = opp.pool_fees.first().map(|&f| (f / 100) as u128);
-        let amount_mid = self.swap_through_pool(flash_amount, &entry_addr, entry_fee, true);
+        let amount_mid = self.swap_through_pool(flash_amount, &entry_addr, entry_fee, true)
+            .ok_or_else(|| anyhow::anyhow!("Entry pool {:?} not in cache", entry_addr))?;
 
         // Step 3: Swap through exit pool (sell mid-token for original token)
         let exit_addr = opp.pool_addresses.get(1).copied().unwrap_or([0u8; 20]);
         let exit_fee = opp.pool_fees.get(1).map(|&f| (f / 100) as u128);
         // Exit pool is reversed: we're selling mid-token (token0) for original (token1)
-        let amount_out = self.swap_through_pool(amount_mid, &exit_addr, exit_fee, false);
+        let amount_out = self.swap_through_pool(amount_mid, &exit_addr, exit_fee, false)
+            .ok_or_else(|| anyhow::anyhow!("Exit pool {:?} not in cache", exit_addr))?;
 
         // Step 4: Calculate profit
         let gross: i128 = amount_out as i128 - flash_amount as i128;
@@ -304,8 +316,8 @@ impl EvmSimulator {
         let net_profit = gross - gas_cost - flash_fee;
 
         // State changes: record the two pool reserve updates
-        let (entry_r0, _, _) = self.pool_reserves(&entry_addr);
-        let (_, exit_r1, _) = self.pool_reserves(&exit_addr);
+        let (entry_r0, _, _) = self.pool_reserves(&entry_addr).unwrap_or((0, 0, 0));
+        let (_, exit_r1, _) = self.pool_reserves(&exit_addr).unwrap_or((0, 0, 0));
         let state_changes = vec![
             StateChange {
                 address: entry_addr,
@@ -334,7 +346,8 @@ impl EvmSimulator {
     fn simulate_backrun(&self, opp: &Opportunity) -> anyhow::Result<SimulationResult> {
         // Look up pool reserves from cache
         let pool_addr = opp.pool_addresses.first().copied().unwrap_or([0u8; 20]);
-        let (r0, r1, fee) = self.pool_reserves(&pool_addr);
+        let (r0, r1, fee) = self.pool_reserves(&pool_addr)
+            .ok_or_else(|| anyhow::anyhow!("Backrun pool {:?} not in cache", pool_addr))?;
 
         let fee = opp.pool_fees.first().map(|&f| (f / 100) as u128).unwrap_or(fee);
 
@@ -352,7 +365,8 @@ impl EvmSimulator {
 
         // Swap back at fair-value pool (another DEX or same after rebalance)
         let exit_addr = opp.pool_addresses.get(1).copied().unwrap_or([0u8; 20]);
-        let (exit_r0, exit_r1, exit_fee) = self.pool_reserves(&exit_addr);
+        let (exit_r0, exit_r1, exit_fee) = self.pool_reserves(&exit_addr)
+            .ok_or_else(|| anyhow::anyhow!("Backrun exit pool {:?} not in cache", exit_addr))?;
         let exit_fee = opp.pool_fees.get(1).map(|&f| (f / 100) as u128).unwrap_or(exit_fee);
 
         let amount_out = constant_product_swap(
@@ -428,6 +442,7 @@ struct PoolStateSnapshot {
     liquidity: u128,
     is_v3: bool,
     current_tick: i32,
+    #[allow(dead_code)]
     tick_spacing: i32,
     ticks: Vec<(i32, u128, i128)>,
 }
@@ -598,7 +613,7 @@ fn div_u256_by_u128(hi: u128, lo: u128, d: u128) -> u128 {
     // Binary long division over the quotient bits.
     // We maintain a running remainder in u128 (valid because remainder < d < 2^128).
     let mut rem = hi % d;
-    let mut q: u128 = 0;
+    let q: u128;
 
     // Process the upper 128 bits of the dividend (they are `hi`).
     // We already extracted rem = hi % d. The quotient contribution from hi
@@ -651,6 +666,7 @@ fn v3_virtual_reserves(liquidity: u128, sqrt_price_x96: u128) -> (u128, u128) {
 /// - `zero_for_one`: swap direction (true = token0→token1, price decreases)
 ///
 /// Falls back to single-range when no ticks are available.
+#[allow(dead_code)]
 pub fn multi_tick_swap(
     amount_in: u128,
     sqrt_price_x96: u128,
@@ -992,27 +1008,23 @@ mod tests {
             tick_spacing: 0,
             ticks: vec![],
         });
-        let (r0, r1, fee) = sim.pool_reserves(&[0xDD; 20]);
+        let (r0, r1, fee) = sim.pool_reserves(&[0xDD; 20]).expect("pool should be cached");
         assert_eq!(r0, 42);
         assert_eq!(r1, 84);
         assert_eq!(fee, 300);
     }
 
     #[test]
-    fn test_pool_reserves_fallback_defaults() {
+    fn test_pool_reserves_missing_returns_none() {
         let sim = EvmSimulator::new(test_config());
-        // Unknown pool → default reserves
-        let (r0, r1, fee) = sim.pool_reserves(&[0xFF; 20]);
-        assert_eq!(r0, DEFAULT_WETH_RESERVE);
-        assert_eq!(r1, DEFAULT_USDC_RESERVE);
-        assert_eq!(fee, DEFAULT_FEE_BPS);
+        // Unknown pool → None instead of silent defaults
+        assert!(sim.pool_reserves(&[0xFF; 20]).is_none());
     }
 
     #[test]
-    fn test_pool_reserves_zero_addr_uses_default() {
+    fn test_pool_reserves_zero_addr_returns_none() {
         let sim = EvmSimulator::new(test_config());
-        let (r0, _r1, _fee) = sim.pool_reserves(&[0u8; 20]);
-        assert_eq!(r0, DEFAULT_WETH_RESERVE);
+        assert!(sim.pool_reserves(&[0u8; 20]).is_none());
     }
 
     // ── Overflow safety ──

@@ -168,7 +168,7 @@ impl ArbitrageDetector {
         let token_out = format!("0x{}", hex::encode(&data[token_out_start..token_out_start + 20]));
 
         // Deadline at offset 132..164
-        let deadline = if data.len() >= 164 {
+        let _deadline = if data.len() >= 164 {
             read_u64_from_word(&data[132..164])
         } else {
             0
@@ -222,7 +222,7 @@ impl ArbitrageDetector {
         let token_in = format!("0x{}", hex::encode(&data[16..36]));   // word 0, right-aligned
         let token_out = format!("0x{}", hex::encode(&data[48..68]));  // word 1
         let fee = read_u32_from_word(&data[68..100]);                  // word 2
-        let deadline = read_u64_from_word(&data[132..164]);            // word 4
+        let _deadline = read_u64_from_word(&data[132..164]);            // word 4
         let amount_in = read_u128_from_word(&data[164..196]);          // word 5
         let amount_out_min = read_u128_from_word(&data[196..228]);     // word 6
 
@@ -378,7 +378,7 @@ impl ArbitrageDetector {
     }
 
     /// Calculate net profit from price discrepancy across DEXes
-    fn calculate_profit(&self, swap: &SwapInfo, prices: &[(DexType, u128)]) -> Option<u128> {
+    fn calculate_profit(&self, _swap: &SwapInfo, prices: &[(DexType, u128)]) -> Option<u128> {
         if prices.len() < 2 {
             return None;
         }

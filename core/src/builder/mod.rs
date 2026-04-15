@@ -29,6 +29,7 @@ const DEX_BALANCER: u8    = 0x05;
 
 /// Bundle builder for MEV extraction
 pub struct BundleBuilder {
+    #[allow(dead_code)]
     config: Arc<Config>,
     count: AtomicU64,
     contract_address: Option<String>,

@@ -94,7 +94,7 @@ impl MempoolMonitor {
         self.running.store(true, Ordering::SeqCst);
         
         // Pin to CPU core if specified
-        if let Some(core) = self.config.cpu_core {
+        if let Some(_core) = self.config.cpu_core {
             #[cfg(target_os = "linux")]
             {
                 use core_affinity::CoreId;

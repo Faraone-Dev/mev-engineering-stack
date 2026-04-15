@@ -10,7 +10,7 @@ use ethers::{
 };
 use std::sync::Arc;
 
-/// Flash arbitrage contract interface
+// Flash arbitrage contract interface
 abigen!(
     FlashArbitrageContract,
     r#"[
@@ -32,6 +32,7 @@ pub struct ExecutorConfig {
 pub struct ArbitrageExecutor {
     provider: Arc<Provider<Http>>,
     config: ExecutorConfig,
+    #[allow(dead_code)]
     balancer_vault: Address,
 }
 
@@ -45,7 +46,7 @@ impl ArbitrageExecutor {
         Self {
             provider,
             config,
-            balancer_vault: Address::from_str("0xBA12222222228d8Ba445958a75a0704d566BF2C8").unwrap(),
+            balancer_vault: Address::from_str("0xBA12222222228d8Ba445958a75a0704d566BF2C8").expect("invalid Balancer vault address"),
         }
     }
     
@@ -59,7 +60,7 @@ impl ArbitrageExecutor {
         let amounts = vec![opp.input_amount];
         
         // Apply slippage protection
-        let min_output = opp.output_amount * (10000 - self.config.slippage_bps) / 10000;
+        let _min_output = opp.output_amount * (10000 - self.config.slippage_bps) / 10000;
         
         // Build transaction
         let contract = FlashArbitrageContract::new(

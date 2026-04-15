@@ -25,11 +25,11 @@ impl Default for ArbitrumConfig {
             chain_id: 42161,
             rpc_url: String::new(),
             ws_url: String::new(),
-            balancer_vault: Address::from_str("0xBA12222222228d8Ba445958a75a0704d566BF2C8").unwrap(),
-            weth: Address::from_str("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1").unwrap(),
-            usdc: Address::from_str("0xaf88d065e77c8cC2239327C5EDb3A432268e5831").unwrap(),
-            usdt: Address::from_str("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9").unwrap(),
-            arb: Address::from_str("0x912CE59144191C1204E64559FE8253a0e49E6548").unwrap(),
+            balancer_vault: Address::from_str("0xBA12222222228d8Ba445958a75a0704d566BF2C8").expect("invalid Balancer vault address"),
+            weth: Address::from_str("0x82aF49447D8a07e3bd95BD0d56f35241523fBab1").expect("invalid WETH address"),
+            usdc: Address::from_str("0xaf88d065e77c8cC2239327C5EDb3A432268e5831").expect("invalid USDC address"),
+            usdt: Address::from_str("0xFd086bC7CD5C481DCC9C85ebE478A1C0b69FCbb9").expect("invalid USDT address"),
+            arb: Address::from_str("0x912CE59144191C1204E64559FE8253a0e49E6548").expect("invalid ARB address"),
         }
     }
 }

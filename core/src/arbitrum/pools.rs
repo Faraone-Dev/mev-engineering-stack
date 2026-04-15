@@ -123,9 +123,9 @@ impl PoolManager {
         Self {
             provider,
             pools: RwLock::new(HashMap::new()),
-            uniswap_v3_factory: Address::from_str("0x1F98431c8aD98523631AE4a59f267346ea31F984").unwrap(),
-            sushi_factory: Address::from_str("0xc35DADB65012eC5796536bD9864eD8773aBc74C4").unwrap(),
-            camelot_factory: Address::from_str("0x6EcCab422D763aC031210895C81787E87B43A652").unwrap(),
+            uniswap_v3_factory: Address::from_str("0x1F98431c8aD98523631AE4a59f267346ea31F984").expect("invalid Uniswap V3 factory"),
+            sushi_factory: Address::from_str("0xc35DADB65012eC5796536bD9864eD8773aBc74C4").expect("invalid SushiSwap factory"),
+            camelot_factory: Address::from_str("0x6EcCab422D763aC031210895C81787E87B43A652").expect("invalid Camelot factory"),
         }
     }
     

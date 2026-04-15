@@ -9,7 +9,7 @@
 //! - Simulator: Two-stage pipeline — AMM math filter + REVM fork execution
 //! - Builder: Bundle construction and submission
 
-#![allow(unused_imports, unused_variables, dead_code, unused_mut)]
+#![allow(unused_imports)]
 
 pub mod config;
 pub mod detector;
@@ -40,6 +40,7 @@ use tracing::{info, error};
 /// MEV Engine orchestrates all components
 #[derive(Clone)]
 pub struct MevEngine {
+    #[allow(dead_code)]
     config: Arc<Config>,
     detector: Arc<OpportunityDetector>,
     simulator: Arc<EvmSimulator>,

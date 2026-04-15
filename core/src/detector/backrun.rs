@@ -34,9 +34,10 @@ pub struct BackrunDetector {
 
 impl BackrunDetector {
     pub fn new(config: Arc<Config>) -> Self {
+        let min_swap = config.strategy.min_backrun_swap_wei;
         Self {
             config,
-            min_swap_size_wei: 10_000_000_000_000_000_000, // 10 ETH
+            min_swap_size_wei: min_swap,
             pool_liquidity: Arc::new(RwLock::new(HashMap::new())),
         }
     }

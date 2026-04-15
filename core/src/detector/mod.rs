@@ -4,6 +4,7 @@ mod arbitrage;
 mod backrun;
 mod liquidation;
 pub mod multi_threaded;
+pub mod sandwich;
 
 pub use arbitrage::ArbitrageDetector;
 pub use backrun::BackrunDetector;
@@ -22,7 +23,6 @@ use crate::config::Config;
 use crate::types::{Opportunity, OpportunityType, PendingTx};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::mpsc;
 use tracing::{info, debug, warn};
 
 /// Main opportunity detector
@@ -32,7 +32,6 @@ pub struct OpportunityDetector {
     backrun: BackrunDetector,
     liquidation: LiquidationDetector,
     count: AtomicU64,
-    tx: Option<mpsc::Sender<Opportunity>>,
 }
 
 impl OpportunityDetector {
@@ -43,7 +42,6 @@ impl OpportunityDetector {
             backrun: BackrunDetector::new(config.clone()),
             liquidation: LiquidationDetector::new(config.clone()),
             count: AtomicU64::new(0),
-            tx: None,
         }
     }
 
@@ -60,17 +58,31 @@ impl OpportunityDetector {
     /// Process a pending transaction
     pub async fn process_tx(&self, tx: PendingTx) -> Vec<Opportunity> {
         let mut opportunities = Vec::new();
+        let enabled = &self.config.strategy.enabled_strategies;
 
         // Check for arbitrage
-        if let Some(opp) = self.arbitrage.detect(&tx).await {
-            debug!("Arbitrage opportunity found: {:?}", opp);
-            opportunities.push(opp);
+        if enabled.iter().any(|s| s == "arbitrage") {
+            if let Some(opp) = self.arbitrage.detect(&tx).await {
+                debug!("Arbitrage opportunity found: {:?}", opp);
+                opportunities.push(opp);
+            }
         }
 
         // Check for backrun
-        if let Some(opp) = self.backrun.detect(&tx).await {
-            debug!("Backrun opportunity found: {:?}", opp);
-            opportunities.push(opp);
+        if enabled.iter().any(|s| s == "backrun") {
+            if let Some(opp) = self.backrun.detect(&tx).await {
+                debug!("Backrun opportunity found: {:?}", opp);
+                opportunities.push(opp);
+            }
+        }
+
+        // Check for liquidation opportunities
+        if enabled.iter().any(|s| s == "liquidation") {
+            let liquidations = self.liquidation.find_liquidatable();
+            for opp in liquidations {
+                debug!("Liquidation opportunity found: {:?}", opp);
+                opportunities.push(opp);
+            }
         }
 
         // Update count
