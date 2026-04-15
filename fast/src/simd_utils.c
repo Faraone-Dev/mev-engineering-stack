@@ -176,12 +176,7 @@ void mev_calc_price_impact_batch(
     uint64_t amount_in,           // Amount to swap
     uint64_t outputs[4]           // Output amounts
 ) {
-    // Load reserves
-    __m256i r0 = _mm256_loadu_si256((const __m256i*)reserves0);
-    __m256i r1 = _mm256_loadu_si256((const __m256i*)reserves1);
-    
     // For each pool: out = (amount_in * 997 * r1) / (r0 * 1000 + amount_in * 997)
-    // Uses __uint128_t intermediates to keep fixed-point math safe.
     
     for (int i = 0; i < 4; i++) {
         uint64_t r0_i = reserves0[i];
@@ -193,10 +188,18 @@ void mev_calc_price_impact_batch(
         }
         
         // AMM formula with 0.3% fee
-        __uint128_t num = (__uint128_t)amount_in * 997 * r1_i;
-        __uint128_t den = (__uint128_t)r0_i * 1000 + (__uint128_t)amount_in * 997;
-        
+        uint64_t amount_fee = amount_in * 997;
+        uint64_t den = r0_i * 1000 + amount_fee;
+#ifdef _MSC_VER
+        // MSVC: no __uint128_t — use _umul128 + _udiv128 intrinsics
+        uint64_t hi, lo;
+        lo = _umul128(amount_fee, r1_i, &hi);
+        uint64_t remainder;
+        outputs[i] = _udiv128(hi, lo, den, &remainder);
+#else
+        __uint128_t num = (__uint128_t)amount_fee * r1_i;
         outputs[i] = (uint64_t)(num / den);
+#endif
     }
 }
 
