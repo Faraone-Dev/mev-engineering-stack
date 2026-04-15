@@ -74,6 +74,13 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Load .env from workspace root (parent of core/)
+    let env_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join(".env");
+    match dotenv::from_path(&env_path) {
+        Ok(_) => info!("✅ Loaded .env from {}", env_path.display()),
+        Err(e) => warn!("⚠️ .env not found at {}: {}", env_path.display(), e),
+    }
+
     // Load configuration
     let config = Config::from_env()?;
     
@@ -90,10 +97,17 @@ async fn main() -> anyhow::Result<()> {
     let tsc_end = rdtsc_native();
     info!("✅ FFI verified | TSC delta: {} cycles", tsc_end - tsc_start);
 
-    // Create mempool monitor
+    // Create mempool monitor with backup WS URLs from env
+    let mut backup_ws = Vec::new();
+    if let Ok(ws2) = std::env::var("ARBITRUM_WS_URL_2") {
+        if !ws2.trim().is_empty() { backup_ws.push(ws2); }
+    }
+    if let Ok(ws3) = std::env::var("ARBITRUM_WS_URL_3") {
+        if !ws3.trim().is_empty() { backup_ws.push(ws3); }
+    }
     let mempool_config = MempoolConfig {
         ws_url: arbitrum_config.ws_url.clone(),
-        backup_ws_urls: vec![],
+        backup_ws_urls: backup_ws,
         max_pending_txs: 10_000,
         cpu_core: Some(0),
         batch_size: 32,
@@ -101,26 +115,39 @@ async fn main() -> anyhow::Result<()> {
     let mempool_monitor = MempoolMonitor::new(mempool_config);
     info!("✅ Mempool monitor initialized");
 
-    // Count configured RPC endpoints
-    let rpc_endpoint_count = {
-        let mut count = 1u64; // primary ARBITRUM_RPC_URL
-        if let Ok(endpoints) = std::env::var("MEV_RPC_ENDPOINTS") {
-            let extra = endpoints.split(',')
-                .filter(|s| !s.trim().is_empty())
-                .count() as u64;
-            if extra > 0 { count = extra; }
-        }
-        count
+    // Build RPC provider list from MEV_RPC_ENDPOINTS (prefers env) or single primary
+    let rpc_urls: Vec<String> = if let Ok(endpoints) = std::env::var("MEV_RPC_ENDPOINTS") {
+        let urls: Vec<String> = endpoints.split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        if urls.is_empty() { vec![arbitrum_config.rpc_url.clone()] } else { urls }
+    } else {
+        vec![arbitrum_config.rpc_url.clone()]
     };
+    let rpc_endpoint_count = rpc_urls.len() as u64;
+    info!("✅ {} RPC endpoints configured", rpc_endpoint_count);
 
-    // Block tracker + TX classifier (Arbitrum has no public mempool — classify from blocks)
-    let rpc_url_clone = arbitrum_config.rpc_url.clone();
+    // Block tracker + TX classifier with multi-provider failover
     let engine_start = std::time::Instant::now();
     tokio::spawn(async move {
-        let provider = match Provider::<Http>::try_from(rpc_url_clone.as_str()) {
-            Ok(p) => p,
-            Err(e) => { warn!("RPC provider failed: {}", e); return; }
-        };
+        // Create all providers upfront — HTTP providers from any URL scheme
+        let mut providers: Vec<Provider<Http>> = Vec::new();
+        for url in &rpc_urls {
+            // Convert wss:// to https:// for HTTP polling (ethers Http transport)
+            let http_url = url.replace("wss://", "https://").replace("ws://", "http://");
+            match Provider::<Http>::try_from(http_url.as_str()) {
+                Ok(p) => providers.push(p),
+                Err(e) => warn!("Failed to create provider from {}: {}", url, e),
+            }
+        }
+        if providers.is_empty() {
+            warn!("No RPC providers available!");
+            return;
+        }
+        info!("✅ {} RPC providers connected", providers.len());
+        let mut healthy_count = providers.len() as f64;
+        let mut current_idx = 0usize;
         let mut prev_block = 0u64;
         let mut total_tx = 0u64;
         let mut _total_swaps_v2 = 0u64;
@@ -164,15 +191,21 @@ async fn main() -> anyhow::Result<()> {
         loop {
             metrics::gauge!("mev_node_uptime_seconds_total")
                 .set(engine_start.elapsed().as_secs_f64());
-            metrics::gauge!("mev_rpc_healthy_endpoints").set(rpc_endpoint_count as f64);
-            metrics::gauge!("mev_rpc_total_endpoints").set(rpc_endpoint_count as f64);
+            metrics::gauge!("mev_rpc_healthy_endpoints").set(healthy_count);
+            metrics::gauge!("mev_rpc_total_endpoints").set(providers.len() as f64);
 
-            match provider.get_block_with_txs(BlockNumber::Latest).await {
+            let rpc_t0 = std::time::Instant::now();
+            match providers[current_idx].get_block_with_txs(BlockNumber::Latest).await {
                 Ok(Some(block)) => {
+                    let rpc_elapsed = rpc_t0.elapsed();
+                    metrics::histogram!("mev_rpc_latency_seconds")
+                        .record(rpc_elapsed.as_secs_f64());
+
                     let num = block.number.map(|n| n.as_u64()).unwrap_or(0);
                     metrics::gauge!("mev_block_latest_number").set(num as f64);
 
                     if num != prev_block && prev_block > 0 {
+                        let block_proc_t0 = std::time::Instant::now();
                         metrics::counter!("mev_block_processed_total").increment(1);
 
                         // Gas oracle
@@ -206,11 +239,9 @@ async fn main() -> anyhow::Result<()> {
                         let mut block_transfers = 0u64;
                         let mut _block_unknown = 0u64;
 
-                        let mut classify_total_ns = 0u64;
+                        let classify_t0 = std::time::Instant::now();
                         for tx in &block.transactions {
-                            let t0 = std::time::Instant::now();
                             let class = classify_tx(&tx.input, tx.value);
-                            classify_total_ns += t0.elapsed().as_nanos() as u64;
                             match class {
                                 "swap_v2" => {
                                     block_swaps_v2 += 1;
@@ -240,11 +271,16 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                         }
+                        let classify_total_ns = classify_t0.elapsed().as_nanos() as u64;
 
                         // Live classification latency (per-tx average in nanoseconds)
                         if tx_count > 0 {
                             let avg_ns = classify_total_ns as f64 / tx_count as f64;
                             metrics::gauge!("mev_classify_latency_ns").set(avg_ns);
+                            // Histogram for dashboard: per-tx average in seconds
+                            let per_tx_secs = avg_ns / 1e9;
+                            metrics::histogram!("mev_pipeline_stage_latency_seconds")
+                                .record(per_tx_secs);
                         }
 
                         // Base fee prediction latency
@@ -285,6 +321,10 @@ async fn main() -> anyhow::Result<()> {
                         metrics::gauge!("mev_mempool_tx_rate_per_sec")
                             .set(total_tx as f64 / engine_start.elapsed().as_secs_f64().max(1.0));
 
+                        // Block processing latency histogram
+                        metrics::histogram!("mev_block_processing_latency_seconds")
+                            .record(block_proc_t0.elapsed().as_secs_f64());
+
                         // Log with classification
                         let swap_str = if block_swaps_v2 + block_swaps_v3 > 0 {
                             format!(" | 🔄 {}v2 {}v3", block_swaps_v2, block_swaps_v3)
@@ -302,7 +342,12 @@ async fn main() -> anyhow::Result<()> {
                     prev_block = num;
                 }
                 Ok(None) => {}
-                Err(e) => { warn!("Block fetch error: {}", e); }
+                Err(e) => {
+                    let old_idx = current_idx;
+                    current_idx = (current_idx + 1) % providers.len();
+                    healthy_count = (healthy_count - 1.0_f64).max(1.0);
+                    warn!("⚠️ RPC #{} error: {} — rotating to #{}", old_idx, e, current_idx);
+                }
             }
 
             tokio::time::sleep(Duration::from_millis(250)).await;

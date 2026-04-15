@@ -1302,10 +1302,12 @@
                     var blockMs = (blockProcSum / blockProcCount) * 1e3;
                     ewmaBasefeeNs = (ewmaBasefeeNs <= 0) ? blockMs : ewmaBasefeeNs * 0.85 + blockMs * 0.15;
                     var bMs = ewmaBasefeeNs;
-                    document.getElementById('blockProcVal').textContent = bMs < 1000 ? bMs.toFixed(0) + 'ms' : (bMs / 1000).toFixed(1) + 's';
+                    var bLabel = bMs < 1 ? (bMs * 1000).toFixed(0) + '\u00B5s' : bMs < 1000 ? bMs.toFixed(1) + 'ms' : (bMs / 1000).toFixed(1) + 's';
+                    document.getElementById('blockProcVal').textContent = bLabel;
                     var bBarPct = Math.min(bMs / 2000, 1) * 100; // scale: 2s = full
                     document.getElementById('blockProcBar').style.width = bBarPct.toFixed(0) + '%';
-                    document.getElementById('blockProcSub').textContent = fmt(blockProcCount) + ' blocks \u2014 avg ' + bMs.toFixed(0) + 'ms \u2014 live';
+                    var bSubLabel = bMs < 1 ? (bMs * 1000).toFixed(0) + '\u00B5s' : bMs.toFixed(0) + 'ms';
+                    document.getElementById('blockProcSub').textContent = fmt(blockProcCount) + ' blocks \u2014 avg ' + bSubLabel + ' \u2014 live';
                 }
 
                 // RPC latency (avg across all endpoints)

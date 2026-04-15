@@ -49,6 +49,13 @@ pub struct StrategyConfig {
     pub max_gas_price_gwei: u64,
     pub slippage_tolerance_bps: u16,
     pub enabled_strategies: Vec<String>,
+    /// Minimum swap size (wei) to consider for backrunning
+    #[serde(default = "default_min_backrun_swap_wei")]
+    pub min_backrun_swap_wei: u128,
+}
+
+fn default_min_backrun_swap_wei() -> u128 {
+    10_000_000_000_000_000_000 // 10 ETH
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -108,6 +115,7 @@ impl Default for Config {
                     "arbitrage".to_string(),
                     "backrun".to_string(),
                 ],
+                min_backrun_swap_wei: default_min_backrun_swap_wei(),
             },
             performance: PerformanceConfig {
                 detector_threads: num_cpus::get(),
