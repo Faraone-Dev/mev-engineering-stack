@@ -1,8 +1,10 @@
 //! FFI bindings for C hot path - PRODUCTION OPTIMIZED
 
 pub mod hot_path;
+pub mod simulator;
 
 use std::ffi::c_void;
+use std::os::raw::c_int;
 
 // Re-export hot_path items
 pub use hot_path::{rdtsc_native, TxBuffer, OpportunityQueue, SwapInfo};
@@ -11,13 +13,13 @@ pub use hot_path::{rdtsc_native, TxBuffer, OpportunityQueue, SwapInfo};
 #[link(name = "mev_fast", kind = "static")]
 extern "C" {
     // Keccak256
-    pub fn mev_keccak256(data: *const u8, len: usize, out: *mut u8);
-    pub fn mev_function_selector(signature: *const u8, len: usize, out: *mut u8);
+    pub fn mev_keccak256(data: *const u8, len: usize, out: *mut u8) -> c_int;
+    pub fn mev_function_selector(signature: *const u8) -> u32;
     
     // RLP encoding
-    pub fn mev_rlp_encode_string(data: *const u8, len: usize, out: *mut u8) -> usize;
-    pub fn mev_rlp_encode_uint256(value: *const u8, out: *mut u8) -> usize;
-    pub fn mev_rlp_encode_address(addr: *const u8, out: *mut u8) -> usize;
+    pub fn mev_rlp_encode_string(data: *const u8, len: usize, out: *mut u8, out_len: *mut usize) -> c_int;
+    pub fn mev_rlp_encode_uint256(value: *const u8, out: *mut u8, out_len: *mut usize) -> c_int;
+    pub fn mev_rlp_encode_address(addr: *const u8, out: *mut u8, out_len: *mut usize) -> c_int;
     
     // SIMD utils
     pub fn mev_memcmp_fast(a: *const u8, b: *const u8, len: usize) -> i32;
@@ -77,7 +79,8 @@ pub fn rlp_encode(input: &[u8]) -> Vec<u8> {
     #[cfg(has_c_fast_path)]
     if !disable_c_fast_path() {
         let mut out = vec![0u8; input.len().saturating_add(16)];
-        let written = unsafe { mev_rlp_encode_string(input.as_ptr(), input.len(), out.as_mut_ptr()) };
+        let mut written: usize = 0;
+        unsafe { mev_rlp_encode_string(input.as_ptr(), input.len(), out.as_mut_ptr(), &mut written); }
         if written > 0 && written <= out.len() {
             out.truncate(written);
             return out;

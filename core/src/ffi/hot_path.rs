@@ -14,26 +14,31 @@
 //! `extern "C"` symbols is discouraged — prefer `safe::*` wrappers.
 
 use std::ffi::c_void;
+use std::os::raw::c_int;
 
 // Link to our C library
 #[cfg(has_c_fast_path)]
 #[link(name = "mev_fast", kind = "static")]
 extern "C" {
     /// Compute Keccak-256 hash of `data[0..len]` and write the 32-byte digest to `out`.
-    pub fn mev_keccak256(data: *const u8, len: usize, out: *mut u8);
+    /// Returns 0 on success, -1 on null pointers.
+    pub fn mev_keccak256(data: *const u8, len: usize, out: *mut u8) -> c_int;
 
-    /// Hash a Solidity function signature (e.g. `"transfer(address,uint256)"`)
-    /// and write the first 4 bytes (selector) to `out`.
-    pub fn mev_function_selector(signature: *const u8, len: usize, out: *mut u8);
+    /// Hash a null-terminated Solidity function signature (e.g. `"transfer(address,uint256)"`)
+    /// and return the 4-byte selector packed as a big-endian u32.
+    pub fn mev_function_selector(signature: *const u8) -> u32;
 
-    /// RLP-encode a byte string. Returns the number of bytes written to `out`.
-    pub fn mev_rlp_encode_string(data: *const u8, len: usize, out: *mut u8) -> usize;
+    /// RLP-encode a byte string. Writes encoded bytes to `out` and sets `*out_len`.
+    /// Returns 0 on success.
+    pub fn mev_rlp_encode_string(data: *const u8, len: usize, out: *mut u8, out_len: *mut usize) -> c_int;
 
-    /// RLP-encode a big-endian uint256 (32-byte `value`). Returns bytes written.
-    pub fn mev_rlp_encode_uint256(value: *const u8, out: *mut u8) -> usize;
+    /// RLP-encode a big-endian uint256 (32-byte `value`). Writes to `out`, sets `*out_len`.
+    /// Returns 0 on success.
+    pub fn mev_rlp_encode_uint256(value: *const u8, out: *mut u8, out_len: *mut usize) -> c_int;
 
-    /// RLP-encode a 20-byte Ethereum address. Returns bytes written (always 21).
-    pub fn mev_rlp_encode_address(addr: *const u8, out: *mut u8) -> usize;
+    /// RLP-encode a 20-byte Ethereum address. Writes to `out`, sets `*out_len`.
+    /// Returns 0 on success.
+    pub fn mev_rlp_encode_address(addr: *const u8, out: *mut u8, out_len: *mut usize) -> c_int;
 
     /// Parse raw swap calldata into a [`SwapInfoFFI`] struct.
     /// Returns 0 on success, non-zero if the selector is unrecognised or data is malformed.
@@ -190,9 +195,10 @@ pub mod safe {
     /// Compute the 4-byte Solidity function selector for a canonical signature.
     #[inline(always)]
     pub fn function_selector(signature: &str) -> [u8; 4] {
-        let mut out = [0u8; 4];
-        unsafe { mev_function_selector(signature.as_ptr(), signature.len(), out.as_mut_ptr()); }
-        out
+        // C function expects null-terminated string and returns packed u32
+        let cstr = std::ffi::CString::new(signature).expect("signature contains null byte");
+        let sel = unsafe { mev_function_selector(cstr.as_ptr() as *const u8) };
+        sel.to_be_bytes()
     }
 
     /// SIMD-accelerated 20-byte address comparison.
@@ -241,7 +247,8 @@ pub mod safe {
     /// RLP-encode a 20-byte Ethereum address.
     pub fn rlp_encode_address(addr: &Address) -> Vec<u8> {
         let mut out = vec![0u8; 21];
-        let len = unsafe { mev_rlp_encode_address(addr.as_bytes().as_ptr(), out.as_mut_ptr()) };
+        let mut len: usize = 0;
+        unsafe { mev_rlp_encode_address(addr.as_bytes().as_ptr(), out.as_mut_ptr(), &mut len); }
         out.truncate(len);
         out
     }
@@ -251,7 +258,8 @@ pub mod safe {
         let mut bytes = [0u8; 32];
         value.to_big_endian(&mut bytes);
         let mut out = vec![0u8; 33];
-        let len = unsafe { mev_rlp_encode_uint256(bytes.as_ptr(), out.as_mut_ptr()) };
+        let mut len: usize = 0;
+        unsafe { mev_rlp_encode_uint256(bytes.as_ptr(), out.as_mut_ptr(), &mut len); }
         out.truncate(len);
         out
     }
